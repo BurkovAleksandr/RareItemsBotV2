@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import requests
 
 
@@ -46,40 +48,44 @@ class Currency:
         41: "UYU",
     }
 
-    def __init__(self, api_key, default_currency=5):
+    def __init__(self, api_key: str, default_currency: int = 5):
         self.api_key = api_key
         self.rates: dict | None = None
-        self.DEFAULT_CURRENCY = 5
+        self.DEFAULT_CURRENCY = default_currency
 
     def change_currency(
-        self, price, start_currency_id: int, target_currency_id: int = -1
-    ):
-        """Convert price for target currency. If target not provided convert to DEFAULT_CURRENCY by defalt."""
+        self,
+        price: float,
+        start_currency_id: int,
+        target_currency_id: int = -1,
+    ) -> float:
+        if self.rates is None:
+            raise RuntimeError("Currency rates are not loaded")
         if target_currency_id == -1:
             target_currency_id = self.DEFAULT_CURRENCY
-        # Остаток от деление на 100 так как изначально currency id приходит в виде 20xx
+
         start_currency_definition = self.rates_ids[start_currency_id % 100]
         target_currency_definition = self.rates_ids[target_currency_id % 100]
         start_currency_value = self.rates[start_currency_definition]
         target_currency_value = self.rates[target_currency_definition]
-        currency = target_currency_value / start_currency_value
-        return price * currency
+        return price * (target_currency_value / start_currency_value)
 
-    def update_steam_currency_rates(
-        self,
-    ):
-        """Обновляет куры валют на актуальные. (Пока что вызов этой функции обязателен перд использоавнием)"""
+    def update_steam_currency_rates(self) -> dict:
         params = {
             "key": self.api_key,
             "format": "json",
             "amp": "",
             "appid": "1764030",
         }
-        url = f"https://api.steampowered.com/ISteamEconomy/GetAssetPrices/v1/"
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            raise Exception(
-                f"Request completed with error code: {response.status_code}"
-            )
-        elif response.json()["result"]["success"] == True:
-            self.rates = response.json()["result"]["assets"][0]["prices"]
+        response = requests.get(
+            "https://api.steampowered.com/ISteamEconomy/GetAssetPrices/v1/",
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload["result"]["success"] is not True:
+            raise RuntimeError(f"Steam currency rates request failed: {payload}")
+
+        self.rates = payload["result"]["assets"][0]["prices"]
+        return self.rates

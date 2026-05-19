@@ -1,15 +1,17 @@
 from dataclasses import dataclass
-from typing import Counter
+from collections import Counter
 
 from assets.inspect import IItemInfoFetcher
 from assets.prices import IItemPriceFetcher
 
 
 class StickerStrick:
-    strick: bool
-    sticker_name: str
-    single_sticker_price: float
-    sum_price_strick: float
+    def __init__(self):
+        self.strick = False
+        self.sticker_name = ""
+        self.strick_count = 0
+        self.single_sticker_price = 0
+        self.sum_price_strick = 0
 
     def update_strick_counter(self, stickers):
         sticker_names = [sticker.get("name") for sticker in stickers]
@@ -19,11 +21,12 @@ class StickerStrick:
             self.strick = False
         else:
             self.strick = True
-            (self.sticker_name, self.strick_count),  = strick
+            (self.sticker_name, self.strick_count), = strick
 
-            self.single_sticker_price = list(filter(lambda x: x.get(
-                "name") == self.sticker_name, stickers))[0].get("price")
-            self.sum_price_strick = self.single_sticker_price*self.strick_count
+            self.single_sticker_price = list(
+                filter(lambda x: x.get("name") == self.sticker_name, stickers)
+            )[0].get("price")
+            self.sum_price_strick = self.single_sticker_price * self.strick_count
 
 
 class ItemData:

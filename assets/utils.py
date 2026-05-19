@@ -1,81 +1,61 @@
-from functools import reduce
+from __future__ import annotations
+
 import json
+import logging
 import time
+
 from assets.item import ItemData
 
 
-def read_json_from_file(file_path) -> dict:
-    """
-    Читает данные из текстового файла в формате JSON и возвращает их как словарь Python.
+logger = logging.getLogger(__name__)
 
-    :param file_path: Путь к текстовому файлу с JSON-данными.
-    :return: Словарь Python с данными из файла.
-    :raises ValueError: Если файл содержит некорректный JSON.
-    :raises FileNotFoundError: Если файл не найден.
-    """
+
+def read_json_from_file(file_path) -> dict:
+    """Read a JSON file and return it as a dictionary."""
     try:
-        # Открываем файл для чтения
         with open(file_path, "r", encoding="utf-8") as file:
-            # Загружаем данные из файла как JSON
-            data = json.load(file)
-            return data
+            return json.load(file)
     except FileNotFoundError:
-        raise FileNotFoundError(f"Файл не найден: {file_path}")
-    except json.JSONDecodeError:
-        raise ValueError(f"Файл содержит некорректный JSON: {file_path}")
+        raise FileNotFoundError(f"File not found: {file_path}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"File contains invalid JSON: {file_path}") from exc
 
 
 def secundomer(func):
     async def wrapper(*args, **kwargs):
-        t1 = time.time()
+        started_at = time.time()
         data = await func(*args, **kwargs)
-        print("Время выполнения: ", time.time() - t1)
+        logger.debug("%s finished in %.2fs", func.__name__, time.time() - started_at)
         return data
 
     return wrapper
 
 
 def construct_inspect_link(item_data: dict, listing_id: str) -> str:
-    """Формирует inspect link из данных"""
-    raw_inspect_link = item_data.get("asset").get("market_actions")[0].get("link")
-    asset_id = item_data.get("asset").get("id")
-    return raw_inspect_link.replace("%listingid%", listing_id).replace(
-        "%assetid%", asset_id
-    )
+    """Build an inspect link from Steam listing data."""
+    asset = item_data.get("asset") or {}
+    raw_inspect_link = (asset.get("market_actions") or [{}])[0].get("link")
+    asset_id = asset.get("id")
+    if not raw_inspect_link or not asset_id:
+        return ""
+    return raw_inspect_link.replace("%listingid%", listing_id).replace("%assetid%", asset_id)
 
 
-def create_message(item: ItemData):
-
-    message = f"🌟 **{item.item_name}** 🌟\n"
-    message += f"Предмет #1\n"
-    message += f"Ссылка: https://steamcommunity.com/market/listings/730/{item.item_name.replace(' ', '%20')}\n"
-    message += f"💲 Цена SM: {item.item_price} Руб\n"
-
-    # Стикеры
-    message += f"🔖 Стикеры:\n"
-    message += f"💲 Общая стоимость стикеров: {item.stickers_price} Руб\n"
-    for sticker in item.stickers:
-        message += f"   • {sticker['name']} - 💲 Цена: {sticker['price']} Руб\n"
-
-    # Чары
-    charm = item.charm
-    if charm:
-        message += f"✨ Очарование:\n"
-        message += f"   • {charm['name']} - 💲 Цена: {item.charm_price} Руб\n"
-
-    return message
-
-
-if __name__ == "__main__":
-
-    # Пример использования
-    item_name = "AK-47 | Slate (Field-Tested)"
-    price = 333.42
-    stickers = [
-        {"name": "Sticker | G2 Esports (Holo) | Stockholm 2024", "price": 339.85},
-        {"name": "Sticker | G2 Esports (Holo) | Stockholm 2024", "price": 339.85},
+def create_message(item: ItemData) -> str:
+    lines = [
+        f"{item.item_name}",
+        f"Listing: {item.listing_id}",
+        f"Market: https://steamcommunity.com/market/listings/730/{item.item_name.replace(' ', '%20')}",
+        f"Steam price: {item.item_price} RUB",
+        f"Sticker total: {item.stickers_price} RUB",
     ]
-    charm = {"name": "Charm | Dragon Lore", "price": 200}
 
-    message = create_message(item_name, price, stickers, charm)
-    print(message)
+    if item.stickers:
+        lines.append("Stickers:")
+        for sticker in item.stickers:
+            lines.append(f"  - {sticker.get('name')} | price: {sticker.get('price')} RUB")
+
+    if item.charm:
+        lines.append(f"Charm: {item.charm.get('name')} | price: {item.charm_price} RUB")
+
+    return "\n".join(lines)
