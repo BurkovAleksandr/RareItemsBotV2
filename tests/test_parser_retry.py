@@ -40,7 +40,7 @@ class FakeSteamSession:
         self.calls = 0
         self.requests = []
 
-    def get_async_session(self):
+    def get_async_session(self, url=None):
         return FakeClientSession(self)
 
 

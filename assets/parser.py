@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -12,7 +14,6 @@ from assets.currency_rates import Currency
 from assets.proxy import ProxyManager
 from assets.session import AsyncSteamSession, SteamSession
 from assets.utils import construct_inspect_link, secundomer
-
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,9 @@ def _extract_listing_info(raw_data: str) -> dict[str, Any]:
     try:
         return _extract_js_object(raw_data, "g_rgListingInfo")
     except ListingInfoNotFound as exc:
-        raise ListingInfoNotFound("Could not find g_rgListingInfo in Steam market page") from exc
+        raise ListingInfoNotFound(
+            "Could not find g_rgListingInfo in Steam market page"
+        ) from exc
 
 
 def _extract_assets_info(raw_data: str) -> dict[str, Any]:
@@ -82,7 +85,9 @@ def merge_render_assets(payload: dict[str, Any]) -> dict[str, Any]:
     return merge_listing_assets(listing_info, assets)
 
 
-def merge_listing_assets(listing_info: dict[str, Any], assets: dict[str, Any]) -> dict[str, Any]:
+def merge_listing_assets(
+    listing_info: dict[str, Any], assets: dict[str, Any]
+) -> dict[str, Any]:
     for item_data in listing_info.values():
         asset = item_data.get("asset") or {}
         app_id = str(asset.get("appid") or "")
@@ -96,7 +101,9 @@ def merge_listing_assets(listing_info: dict[str, Any], assets: dict[str, Any]) -
     return listing_info
 
 
-def _asset_property(asset: dict[str, Any], property_id: int, value_key: str = "string_value"):
+def _asset_property(
+    asset: dict[str, Any], property_id: int, value_key: str = "string_value"
+):
     for item_property in asset.get("asset_properties") or []:
         if item_property.get("propertyid") == property_id:
             return item_property.get(value_key)
@@ -159,7 +166,10 @@ def extract_asset_metadata(asset: dict[str, Any]) -> dict[str, Any]:
         "asset_id": str(asset.get("id") or asset.get("assetid") or ""),
         "appid": asset.get("appid"),
         "contextid": str(asset.get("contextid") or ""),
-        "market_name": asset.get("market_name") or asset.get("market_hash_name") or asset.get("name") or "",
+        "market_name": asset.get("market_name")
+        or asset.get("market_hash_name")
+        or asset.get("name")
+        or "",
         "float_value": extract_float_value(asset),
         "pattern_template": extract_pattern_template(asset),
         "item_certificate": extract_item_certificate(asset),
@@ -170,7 +180,9 @@ def extract_asset_metadata(asset: dict[str, Any]) -> dict[str, Any]:
 
 def summarize_market_page(raw_data: str) -> str:
     soup = BeautifulSoup(raw_data, "html.parser")
-    title = (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+    title = (
+        (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+    )
     lowered = raw_data.lower()
     hints = []
     if "login" in lowered or "sign in" in lowered:
@@ -190,7 +202,9 @@ def validate_render_payload(payload: dict[str, Any], render_url: str) -> None:
         message = payload.get("message") or payload.get("error") or "unknown error"
         raise RuntimeError(f"Steam market render failed for {render_url}: {message}")
     if not isinstance(payload.get("listinginfo"), dict):
-        raise RuntimeError(f"Steam market render returned no listinginfo for {render_url}")
+        raise RuntimeError(
+            f"Steam market render returned no listinginfo for {render_url}"
+        )
 
 
 class AsyncParser:
@@ -201,21 +215,35 @@ class AsyncParser:
         request_timeout: int = 10,
         max_retries: int = 3,
         retry_base_delay: float = 1.0,
+        debug_response_path: str | None = None,
     ):
         self.steam_session = session
         self.proxy_manager = proxy_manager
         self.request_timeout = request_timeout
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
+        self.debug_response_path = debug_response_path or os.getenv(
+            "MARKET_RESPONSE_DEBUG_PATH"
+        )
         self.retry_statuses = {429, 500, 502, 503, 504}
+
+    def _save_debug_response(self, text: str) -> None:
+        if not self.debug_response_path:
+            return
+
+        debug_path = Path(self.debug_response_path)
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_path.write_text(text, encoding="utf-8")
 
     @secundomer
     async def get_raw_data_from_market(self, url: str) -> str:
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
-            proxy = self.proxy_manager.get_random_proxy() if self.proxy_manager else None
+            proxy = (
+                self.proxy_manager.get_random_proxy() if self.proxy_manager else None
+            )
             try:
-                async with self.steam_session.get_async_session() as local_session:
+                async with self.steam_session.get_async_session(url) as local_session:
                     response = await local_session.get(
                         url,
                         proxy=proxy,
@@ -223,6 +251,14 @@ class AsyncParser:
                         timeout=self.request_timeout,
                     )
                     text = await response.text()
+                    self._save_debug_response(text)
+                    final_url = str(getattr(response, "url", url))
+                    if final_url != url:
+                        logger.warning(
+                            "Steam market page redirected from %s to %s",
+                            url,
+                            final_url,
+                        )
                     if response.status == 200:
                         return text
 
@@ -250,15 +286,21 @@ class AsyncParser:
 
         if last_error:
             raise last_error
-        raise RuntimeError(f"Could not fetch Steam market page after {self.max_retries} attempts")
+        raise RuntimeError(
+            f"Could not fetch Steam market page after {self.max_retries} attempts"
+        )
 
     async def get_json_from_market_render(self, url: str) -> dict[str, Any]:
         render_url = build_market_render_url(url)
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
-            proxy = self.proxy_manager.get_random_proxy() if self.proxy_manager else None
+            proxy = (
+                self.proxy_manager.get_random_proxy() if self.proxy_manager else None
+            )
             try:
-                async with self.steam_session.get_async_session() as local_session:
+                async with self.steam_session.get_async_session(
+                    render_url
+                ) as local_session:
                     response = await local_session.get(
                         render_url,
                         proxy=proxy,
@@ -285,7 +327,9 @@ class AsyncParser:
                         self.max_retries,
                     )
                     if response.status not in self.retry_statuses:
-                        raise RuntimeError(f"Steam market render returned HTTP {response.status}")
+                        raise RuntimeError(
+                            f"Steam market render returned HTTP {response.status}"
+                        )
             except Exception as exc:
                 last_error = exc
                 logger.warning(
@@ -301,7 +345,9 @@ class AsyncParser:
 
         if last_error:
             raise last_error
-        raise RuntimeError(f"Could not fetch Steam market render after {self.max_retries} attempts")
+        raise RuntimeError(
+            f"Could not fetch Steam market render after {self.max_retries} attempts"
+        )
 
     async def get_listing_info_from_market(self, url: str) -> dict[str, Any]:
         raw_data = await self.get_raw_data_from_market(url)
@@ -321,7 +367,9 @@ class AsyncParser:
         return _extract_listing_info(raw_data)
 
     def calculate_price(self, item_data: dict) -> tuple[int, int, int]:
-        price_no_fee = int(item_data.get("converted_price") or item_data.get("price") or 0)
+        price_no_fee = int(
+            item_data.get("converted_price") or item_data.get("price") or 0
+        )
         fee = int(item_data.get("converted_fee") or item_data.get("fee") or 0)
         price = price_no_fee + fee
         return price_no_fee, fee, price
@@ -354,7 +402,9 @@ class Parser:
     def get_raw_data_from_market(self, url: str) -> str:
         response = self.steam_session.session.get(url)
         if response.status_code != 200:
-            raise RuntimeError(f"Steam market page returned HTTP {response.status_code}")
+            raise RuntimeError(
+                f"Steam market page returned HTTP {response.status_code}"
+            )
         return response.text
 
     def extract_json_from_raw_data(self, raw_data: str) -> dict[str, Any]:

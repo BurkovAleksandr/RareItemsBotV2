@@ -2,8 +2,9 @@ import os
 import pickle
 import requests
 from typing import Optional, Protocol
+from aiohttp import CookieJar
 from aiohttp.client import ClientSession
-from requests.utils import dict_from_cookiejar
+from requests import Request
 
 from assets.steampy_compat import apply_steampy_compat
 
@@ -148,24 +149,24 @@ class AsyncSteamSession(ISteamSession):
             login_cookies=self.login_cookies,
         )
 
-    def get_async_session(self):
-        # Можете передать заголовки из вашей существующей сессии
+    def _cookie_header_for_url(self, url: str) -> str:
+        sync_session = self.client.get_session()
+        prepared_request = sync_session.prepare_request(Request("GET", url))
+        return prepared_request.headers.get("Cookie", "")
+
+    def get_async_session(self, url: str = "https://steamcommunity.com/"):
         headers = {
-            "Host": "steamcommunity.com",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br, zstd",
-            "DNT": "1",
-            "Sec-GPC": "1",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "cross-site",
-            "Priority": "u=0, i",
         }
-        cookie_jar = dict_from_cookiejar(self.client.get_session().cookies)
-        return ClientSession(headers=headers, cookies=cookie_jar)
+        cookie_header = self._cookie_header_for_url(url)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        return ClientSession(headers=headers, cookie_jar=CookieJar(unsafe=True))
 
     def get_session(self):
         return self.client.get_session()
