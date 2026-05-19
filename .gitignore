@@ -26,3 +26,12 @@ __pycache__/
 accounts/
 settings.py
 NebulaAuth
+config/
+
+# Local scratch/dev files kept outside version control.
+Dockerfile
+docker-compose.yml
+reqirements.txt
+tests.py
+docs/steampy_migration_report.md
+tests/steam_api_tests.py
