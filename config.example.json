@@ -1,0 +1,20 @@
+{
+  "API_KEY": "put_steam_web_api_key_here",
+  "PARSER_LOGIN": "parser_account_login",
+  "PARSER_PASSWORD": "parser_account_password",
+  "PARSER_MAFILE": "./mafiles/parser.maFile",
+  "BUYER_LOGIN": "buyer_account_login",
+  "BUYER_PASSWORD": "buyer_account_password",
+  "BUYER_MAFILE": "./mafiles/buyer.maFile",
+  "STRICK3": 0,
+  "STRICK45": 0,
+  "NOSTRICK": 0,
+  "AUTOBUY": false,
+  "MIN_STICKERS_PRICE": 0,
+  "ACCOUNTS_DIR": "./accounts/",
+  "DB_PATH": "./db.db",
+  "USE_PROXIES": false,
+  "PROXIES_PATH": "./proxies.txt",
+  "REFRESH_CURRENCY_RATES": true,
+  "REFRESH_ITEM_PRICES": false
+}

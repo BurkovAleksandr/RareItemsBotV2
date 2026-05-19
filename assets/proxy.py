@@ -14,10 +14,15 @@ class IProxyManager(Protocol):
 
 
 class ProxyManager(IProxyManager):
-    def __init__(self) -> None:
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled
         self.proxies: list[str] = []
 
     def load_proxies(self, path: str | Path) -> None:
+        if not self.enabled:
+            self.proxies = []
+            return
+
         proxy_path = Path(path)
         if not proxy_path.exists():
             self.proxies = []
@@ -30,7 +35,7 @@ class ProxyManager(IProxyManager):
         ]
 
     def get_random_proxy(self) -> str | None:
-        if not self.proxies:
+        if not self.enabled or not self.proxies:
             return None
 
         proxy = random.choice(self.proxies).strip()

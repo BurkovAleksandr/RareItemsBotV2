@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
+from typing import Iterable
 
 
 class SqliteItemsRepository:
@@ -51,6 +52,25 @@ class SqliteItemsRepository:
         items = self.db.execute("SELECT item_name, item_url FROM TrackItems").fetchall()
         return [{item[0]: item[1]} for item in items]
 
+    def replace_track_items(self, items: Iterable[tuple[str, str]]) -> int:
+        item_rows = [(str(name), str(url)) for name, url in items if name and url]
+        self.db.execute("DELETE FROM TrackItems")
+        self.db.executemany(
+            "INSERT INTO TrackItems (item_name, item_url) VALUES (?, ?)",
+            item_rows,
+        )
+        self.db.commit()
+        return len(item_rows)
+
+    def add_track_items(self, items: Iterable[tuple[str, str]]) -> int:
+        item_rows = [(str(name), str(url)) for name, url in items if name and url]
+        self.db.executemany(
+            "INSERT INTO TrackItems (item_name, item_url) VALUES (?, ?)",
+            item_rows,
+        )
+        self.db.commit()
+        return len(item_rows)
+
     def add_to_checked(self, listing_id) -> None:
         column = self._checked_column()
         self.db.execute(
@@ -87,6 +107,12 @@ class Items:
 
     def get_track_items(self):
         return self.repository.get_track_items()
+
+    def replace_track_items(self, items):
+        return self.repository.replace_track_items(items)
+
+    def add_track_items(self, items):
+        return self.repository.add_track_items(items)
 
     def add_to_checked(self, listing_id):
         self.repository.add_to_checked(listing_id)
