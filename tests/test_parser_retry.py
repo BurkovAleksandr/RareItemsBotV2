@@ -121,6 +121,15 @@ def test_async_parser_falls_back_to_render_endpoint_when_listing_info_missing():
             "price": 115,
             "price_no_fee": 100,
             "fee": 15,
+            "asset_id": "asset-1",
+            "appid": 730,
+            "contextid": "2",
+            "market_name": "",
+            "float_value": None,
+            "pattern_template": None,
+            "item_certificate": None,
+            "stickers": [],
+            "charm": {},
         }
     ]
 
@@ -129,3 +138,87 @@ def test_merge_render_assets_keeps_listing_without_asset_description():
     payload = {"listinginfo": {"123": {"asset": {"appid": 730, "contextid": "2", "id": "missing"}}}}
 
     assert merge_render_assets(payload) == payload["listinginfo"]
+
+
+def test_async_parser_extracts_market_page_asset_metadata():
+    assets = {
+        "730": {
+            "2": {
+                "asset-1": {
+                    "appid": 730,
+                    "contextid": "2",
+                    "id": "asset-1",
+                    "market_hash_name": "AK-47 | Slate (Field-Tested)",
+                    "market_actions": [
+                        {"link": "steam://inspect/%listingid%/%assetid%", "name": "Inspect in Game..."}
+                    ],
+                    "asset_properties": [
+                        {"propertyid": 1, "int_value": "570"},
+                        {"propertyid": 2, "float_value": "0.359291106462478638"},
+                        {"propertyid": 6, "string_value": "certificate"},
+                    ],
+                    "descriptions": [
+                        {
+                            "type": "html",
+                            "name": "sticker_info",
+                            "value": (
+                                '<div><img src="sticker.png" '
+                                'title="Sticker: Bad News Eagles (Glitter) | Paris 2023"></div>'
+                            ),
+                        },
+                        {
+                            "type": "html",
+                            "name": "keychain_info",
+                            "value": '<div><img src="charm.png" title="Charm: Biomech"></div>',
+                        },
+                    ],
+                }
+            }
+        }
+    }
+    listing_info = {
+        "listing-1": {
+            "converted_price": 100,
+            "converted_fee": 15,
+            "asset": {"appid": 730, "contextid": "2", "id": "asset-1"},
+        }
+    }
+    html = (
+        '<script type="text/javascript">'
+        f"var g_rgAssets = {json.dumps(assets)};\n"
+        f"var g_rgListingInfo = {json.dumps(listing_info)};\n"
+        "</script>"
+    )
+    session = FakeSteamSession([FakeResponse(200, html)])
+    parser = AsyncParser(session, request_timeout=1, max_retries=1, retry_base_delay=0)
+
+    parsed_listing_info = asyncio.run(
+        parser.get_listing_info_from_market(
+            "https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29"
+        )
+    )
+    items = parser.extract_item_data(parsed_listing_info)
+
+    assert items == [
+        {
+            "listing_id": "listing-1",
+            "inspect_link": "steam://inspect/listing-1/asset-1",
+            "price": 115,
+            "price_no_fee": 100,
+            "fee": 15,
+            "asset_id": "asset-1",
+            "appid": 730,
+            "contextid": "2",
+            "market_name": "AK-47 | Slate (Field-Tested)",
+            "float_value": 0.35929110646247864,
+            "pattern_template": 570,
+            "item_certificate": "certificate",
+            "stickers": [
+                {
+                    "name": "Bad News Eagles (Glitter) | Paris 2023",
+                    "icon_url": "sticker.png",
+                }
+            ],
+            "charm": {"name": "Biomech", "icon_url": "charm.png"},
+        }
+    ]

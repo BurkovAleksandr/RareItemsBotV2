@@ -21,16 +21,32 @@ class ListingInfoNotFound(ValueError):
     pass
 
 
-def _extract_listing_info(raw_data: str) -> dict[str, Any]:
+def _extract_js_object(raw_data: str, variable_name: str) -> dict[str, Any]:
     soup = BeautifulSoup(raw_data, "html.parser")
     scripts = soup.find_all("script", {"type": "text/javascript"})
+    decoder = json.JSONDecoder()
+    marker = f"var {variable_name} = "
     for script in reversed(scripts):
         script_text = script.string or script.get_text()
-        marker = "var g_rgListingInfo = "
         if marker in script_text:
-            listing_info = script_text.split(marker, 1)[1].split(";", 1)[0]
-            return json.loads(listing_info)
-    raise ListingInfoNotFound("Could not find g_rgListingInfo in Steam market page")
+            json_text = script_text.split(marker, 1)[1].lstrip()
+            parsed_object, _ = decoder.raw_decode(json_text)
+            return parsed_object
+    raise ListingInfoNotFound(f"Could not find {variable_name} in Steam market page")
+
+
+def _extract_listing_info(raw_data: str) -> dict[str, Any]:
+    try:
+        return _extract_js_object(raw_data, "g_rgListingInfo")
+    except ListingInfoNotFound as exc:
+        raise ListingInfoNotFound("Could not find g_rgListingInfo in Steam market page") from exc
+
+
+def _extract_assets_info(raw_data: str) -> dict[str, Any]:
+    try:
+        return _extract_js_object(raw_data, "g_rgAssets")
+    except ListingInfoNotFound:
+        return {}
 
 
 def build_market_render_url(
@@ -63,6 +79,10 @@ def build_market_render_url(
 def merge_render_assets(payload: dict[str, Any]) -> dict[str, Any]:
     listing_info = payload.get("listinginfo") or {}
     assets = payload.get("assets") or {}
+    return merge_listing_assets(listing_info, assets)
+
+
+def merge_listing_assets(listing_info: dict[str, Any], assets: dict[str, Any]) -> dict[str, Any]:
     for item_data in listing_info.values():
         asset = item_data.get("asset") or {}
         app_id = str(asset.get("appid") or "")
@@ -74,6 +94,78 @@ def merge_render_assets(payload: dict[str, Any]) -> dict[str, Any]:
             merged_asset.update(asset)
             item_data["asset"] = merged_asset
     return listing_info
+
+
+def _asset_property(asset: dict[str, Any], property_id: int, value_key: str = "string_value"):
+    for item_property in asset.get("asset_properties") or []:
+        if item_property.get("propertyid") == property_id:
+            return item_property.get(value_key)
+    return None
+
+
+def extract_float_value(asset: dict[str, Any]) -> float | None:
+    value = _asset_property(asset, 2, "float_value")
+    return float(value) if value not in (None, "") else None
+
+
+def extract_pattern_template(asset: dict[str, Any]) -> int | None:
+    value = _asset_property(asset, 1, "int_value")
+    return int(value) if value not in (None, "") else None
+
+
+def extract_item_certificate(asset: dict[str, Any]) -> str | None:
+    return _asset_property(asset, 6, "string_value")
+
+
+def _description_html(asset: dict[str, Any], description_name: str) -> str:
+    parts = []
+    for description in asset.get("descriptions") or []:
+        value = description.get("value") or ""
+        if description.get("name") == description_name or description_name in value:
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _extract_titled_images(raw_html: str, prefix: str) -> list[dict[str, str]]:
+    if not raw_html:
+        return []
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+    items = []
+    for image in soup.find_all("img"):
+        title = (image.get("title") or "").strip()
+        if not title.startswith(prefix):
+            continue
+        items.append(
+            {
+                "name": title.removeprefix(prefix).strip(),
+                "icon_url": image.get("src") or "",
+            }
+        )
+    return items
+
+
+def extract_stickers(asset: dict[str, Any]) -> list[dict[str, str]]:
+    return _extract_titled_images(_description_html(asset, "sticker_info"), "Sticker:")
+
+
+def extract_charm(asset: dict[str, Any]) -> dict[str, str]:
+    charms = _extract_titled_images(_description_html(asset, "keychain_info"), "Charm:")
+    return charms[0] if charms else {}
+
+
+def extract_asset_metadata(asset: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "asset_id": str(asset.get("id") or asset.get("assetid") or ""),
+        "appid": asset.get("appid"),
+        "contextid": str(asset.get("contextid") or ""),
+        "market_name": asset.get("market_name") or asset.get("market_hash_name") or asset.get("name") or "",
+        "float_value": extract_float_value(asset),
+        "pattern_template": extract_pattern_template(asset),
+        "item_certificate": extract_item_certificate(asset),
+        "stickers": extract_stickers(asset),
+        "charm": extract_charm(asset),
+    }
 
 
 def summarize_market_page(raw_data: str) -> str:
@@ -214,7 +306,8 @@ class AsyncParser:
     async def get_listing_info_from_market(self, url: str) -> dict[str, Any]:
         raw_data = await self.get_raw_data_from_market(url)
         try:
-            return self.extract_json_from_raw_data(raw_data)
+            listing_info = self.extract_json_from_raw_data(raw_data)
+            return merge_listing_assets(listing_info, _extract_assets_info(raw_data))
         except ListingInfoNotFound:
             logger.warning(
                 "Steam market page did not contain g_rgListingInfo for %s; falling back to render endpoint (%s)",
@@ -238,6 +331,8 @@ class AsyncParser:
         for listing_id, item_data in items_json.items():
             inspect_link = construct_inspect_link(item_data, listing_id)
             price_no_fee, fee, price = self.calculate_price(item_data)
+            asset = item_data.get("asset") or {}
+            metadata = extract_asset_metadata(asset)
             extracted_items.append(
                 {
                     "listing_id": listing_id,
@@ -245,6 +340,7 @@ class AsyncParser:
                     "price": price,
                     "price_no_fee": price_no_fee,
                     "fee": fee,
+                    **metadata,
                 }
             )
         return extracted_items

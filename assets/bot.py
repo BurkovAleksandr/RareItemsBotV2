@@ -163,6 +163,7 @@ class AsyncSteamBot:
                 listing_id,
                 item.get("inspect_link"),
                 item_price,
+                listing_metadata=item,
             )
             try:
                 await asyncio.to_thread(item_obj.update_item_info)

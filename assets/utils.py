@@ -49,6 +49,10 @@ def create_message(item: ItemData) -> str:
         f"Steam price: {item.item_price} RUB",
         f"Sticker total: {item.stickers_price} RUB",
     ]
+    if item.float_value is not None:
+        lines.append(f"Float: {item.float_value}")
+    if item.pattern_template is not None:
+        lines.append(f"Pattern: {item.pattern_template}")
 
     if item.stickers:
         lines.append("Stickers:")
