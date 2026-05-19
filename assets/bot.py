@@ -21,7 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 class ISteamBot(Protocol):
-    async def start(self) -> None:
+    async def start(self, stop_event: asyncio.Event | None = None) -> None:
+        pass
+
+    def stop(self) -> None:
         pass
 
 
@@ -43,6 +46,31 @@ class AsyncSteamBot:
         self.config = config
         self.buy_module = buy_module
         self.items_manager = items
+        self._stop_event: asyncio.Event | None = None
+        self._running = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def stop(self) -> None:
+        if self._stop_event:
+            self._stop_event.set()
+
+    def _stop_requested(self) -> bool:
+        return bool(self._stop_event and self._stop_event.is_set())
+
+    async def _sleep_or_stop(self, delay: float) -> bool:
+        if delay <= 0:
+            return self._stop_requested()
+        if not self._stop_event:
+            await asyncio.sleep(delay)
+            return False
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def get_items_from_market(self, item_url: str) -> list[dict]:
         raw_data = await self.parser.get_raw_data_from_market(item_url)
@@ -50,11 +78,14 @@ class AsyncSteamBot:
         return self.parser.extract_item_data(json_data)
 
     async def create_one_task(self, item_name: str, item_url: str, delay: float) -> None:
-        await asyncio.sleep(delay)
+        if await self._sleep_or_stop(delay):
+            return
         try:
             listings = await self.get_items_from_market(item_url)
         except Exception:
             logger.exception("Failed to fetch market listings for %s", item_name)
+            return
+        if self._stop_requested():
             return
         await self.process_items(item_name, listings)
 
@@ -67,28 +98,42 @@ class AsyncSteamBot:
                 tasks.append(self.create_one_task(item_name, item_url, delay=delay))
         return tasks
 
-    async def start(self) -> None:
-        if not self.session.is_alive():
-            raise RuntimeError("Steam session is not alive")
+    async def start(self, stop_event: asyncio.Event | None = None) -> None:
+        if self._running:
+            raise RuntimeError("Bot is already running")
 
-        logger.info("Bot started with an active Steam session")
-        counter = 0
-        completed_requests = 0
-        while True:
-            items = self.items_manager.get_track_items()
-            queue = await self.create_task_queue(items=items, batch=1, batch_queue=20)
-            completed_requests += len(queue)
+        self._stop_event = stop_event or asyncio.Event()
+        self._running = True
+        try:
+            if not await asyncio.to_thread(self.session.is_alive):
+                raise RuntimeError("Steam session is not alive")
 
-            started_at = time.time()
-            await asyncio.gather(*queue)
-            logger.info(
-                "Iteration %s finished: %s requests, total requests %s, elapsed %.2fs",
-                counter,
-                len(queue),
-                completed_requests,
-                time.time() - started_at,
-            )
-            counter += 1
+            logger.info("Bot started with an active Steam session")
+            counter = 0
+            completed_requests = 0
+            while not self._stop_requested():
+                items = await asyncio.to_thread(self.items_manager.get_track_items)
+                if not items:
+                    logger.warning("No tracked items configured; sleeping before the next check")
+                    await self._sleep_or_stop(5)
+                    continue
+
+                queue = await self.create_task_queue(items=items, batch=1, batch_queue=20)
+                completed_requests += len(queue)
+
+                started_at = time.time()
+                await asyncio.gather(*queue, return_exceptions=True)
+                logger.info(
+                    "Iteration %s finished: %s requests, total requests %s, elapsed %.2fs",
+                    counter,
+                    len(queue),
+                    completed_requests,
+                    time.time() - started_at,
+                )
+                counter += 1
+        finally:
+            self._running = False
+            logger.info("Bot stopped")
 
     async def process_items(self, item_name: str, items: list[dict]) -> None:
         if not items:
@@ -96,11 +141,15 @@ class AsyncSteamBot:
             return
 
         for item in items:
+            if self._stop_requested():
+                return
+
             listing_id = item.get("listing_id")
-            if not listing_id or self.items_manager.check(listing_id):
+            already_checked = await asyncio.to_thread(self.items_manager.check, listing_id) if listing_id else True
+            if not listing_id or already_checked:
                 continue
 
-            self.items_manager.add_to_checked(listing_id)
+            await asyncio.to_thread(self.items_manager.add_to_checked, listing_id)
             price_cents = item.get("price")
             fee = item.get("fee")
             if not price_cents or fee is None:
@@ -117,7 +166,7 @@ class AsyncSteamBot:
                 item_price,
             )
             try:
-                item_obj.update_item_info()
+                await asyncio.to_thread(item_obj.update_item_info)
             except Exception:
                 logger.exception("Failed to fetch inspect data for listing %s", listing_id)
                 continue
@@ -131,8 +180,15 @@ class AsyncSteamBot:
                 continue
 
             try:
-                purchase_result = self.buy_module.buy_item(item_name, listing_id, price_cents, fee)
-                self.items_manager.add_to_bought_items(
+                purchase_result = await asyncio.to_thread(
+                    self.buy_module.buy_item,
+                    item_name,
+                    listing_id,
+                    price_cents,
+                    fee,
+                )
+                await asyncio.to_thread(
+                    self.items_manager.add_to_bought_items,
                     item_name,
                     listing_id,
                     item_price,

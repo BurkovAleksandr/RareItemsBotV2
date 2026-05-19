@@ -1,10 +1,10 @@
 {
-  "API_KEY": "put_steam_web_api_key_here",
+  "API_KEY": "env:STEAM_API_KEY",
   "PARSER_LOGIN": "parser_account_login",
-  "PARSER_PASSWORD": "parser_account_password",
+  "PARSER_PASSWORD": "env:STEAM_PARSER_PASSWORD",
   "PARSER_MAFILE": "./mafiles/parser.maFile",
   "BUYER_LOGIN": "buyer_account_login",
-  "BUYER_PASSWORD": "buyer_account_password",
+  "BUYER_PASSWORD": "env:STEAM_BUYER_PASSWORD",
   "BUYER_MAFILE": "./mafiles/buyer.maFile",
   "STRICK3": 0,
   "STRICK45": 0,

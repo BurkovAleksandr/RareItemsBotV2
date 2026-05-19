@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -32,19 +33,59 @@ class AsyncParser:
         self,
         session: AsyncSteamSession,
         proxy_manager: ProxyManager | None = None,
+        request_timeout: int = 10,
+        max_retries: int = 3,
+        retry_base_delay: float = 1.0,
     ):
         self.steam_session = session
         self.proxy_manager = proxy_manager
+        self.request_timeout = request_timeout
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
+        self.retry_statuses = {429, 500, 502, 503, 504}
 
     @secundomer
     async def get_raw_data_from_market(self, url: str) -> str:
-        proxy = self.proxy_manager.get_random_proxy() if self.proxy_manager else None
-        async with self.steam_session.get_async_session() as local_session:
-            response = await local_session.get(url, proxy=proxy, ssl=False, timeout=10)
-            text = await response.text()
-            if response.status != 200:
-                logger.warning("Steam market page returned HTTP %s for %s", response.status, url)
-            return text
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            proxy = self.proxy_manager.get_random_proxy() if self.proxy_manager else None
+            try:
+                async with self.steam_session.get_async_session() as local_session:
+                    response = await local_session.get(
+                        url,
+                        proxy=proxy,
+                        ssl=False,
+                        timeout=self.request_timeout,
+                    )
+                    text = await response.text()
+                    if response.status == 200:
+                        return text
+
+                    logger.warning(
+                        "Steam market page returned HTTP %s for %s on attempt %s/%s",
+                        response.status,
+                        url,
+                        attempt,
+                        self.max_retries,
+                    )
+                    if response.status not in self.retry_statuses:
+                        return text
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Steam market request failed for %s on attempt %s/%s: %s",
+                    url,
+                    attempt,
+                    self.max_retries,
+                    exc,
+                )
+
+            if attempt < self.max_retries:
+                await asyncio.sleep(self.retry_base_delay * attempt)
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"Could not fetch Steam market page after {self.max_retries} attempts")
 
     def extract_json_from_raw_data(self, raw_data: str) -> dict[str, Any]:
         return _extract_listing_info(raw_data)

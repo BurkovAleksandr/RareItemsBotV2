@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,18 @@ def _config_bool(value: Any, default: bool = False) -> bool:
         if normalized in {"0", "false", "no", "n", "off", ""}:
             return False
     return bool(value)
+
+
+def _resolve_config_value(value: Any, default=None):
+    if not isinstance(value, str):
+        return value
+
+    stripped = value.strip()
+    if stripped.startswith("env:"):
+        return os.getenv(stripped[4:].strip(), default)
+    if stripped.startswith("${") and stripped.endswith("}"):
+        return os.getenv(stripped[2:-1].strip(), default)
+    return value
 
 
 @dataclass(frozen=True)
@@ -56,7 +69,7 @@ class RuntimeConfig:
             env_value = os.getenv(name)
             if env_value not in (None, ""):
                 return env_value
-            return data.get(name, default)
+            return _resolve_config_value(data.get(name, default), default)
 
         required = [
             "API_KEY",
@@ -158,16 +171,16 @@ async def get_steam_session(
     )
 
     try:
-        steam_session.load_client(accounts_dir)
-        if steam_session.is_alive():
+        await asyncio.to_thread(steam_session.load_client, accounts_dir)
+        if await asyncio.to_thread(steam_session.is_alive):
             logger.info("Loaded active Steam session for %s", login)
             return steam_session
         logger.info("Saved Steam session for %s is stale", login)
     except Exception:
         logger.info("No reusable Steam session for %s; logging in", login)
 
-    steam_session.login()
-    steam_session.save_client(accounts_dir)
+    await asyncio.to_thread(steam_session.login)
+    await asyncio.to_thread(steam_session.save_client, accounts_dir)
     logger.info("Logged in and saved Steam session for %s", login)
     return steam_session
 
@@ -212,7 +225,7 @@ async def create_bot(runtime_config: RuntimeConfig):
 
     currency_rates = Currency(runtime_config.api_key)
     if runtime_config.refresh_currency_rates:
-        currency_rates.update_steam_currency_rates()
+        await asyncio.to_thread(currency_rates.update_steam_currency_rates)
 
     proxy_manager = load_proxy_manager(runtime_config)
 
@@ -222,7 +235,7 @@ async def create_bot(runtime_config: RuntimeConfig):
         proxy_manager=proxy_manager,
     )
     if runtime_config.refresh_item_prices:
-        item_price_fetcher.update_all_prices(currency_rates)
+        await asyncio.to_thread(item_price_fetcher.update_all_prices, currency_rates)
 
     bot_config = Config(
         runtime_config.strick3,

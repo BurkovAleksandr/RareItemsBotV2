@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from typing import Protocol
 
 import requests
@@ -25,31 +26,34 @@ class IPricesRepository(Protocol):
 
 class PricesRepository(IPricesRepository):
     def __init__(self, db_path: str):
-        self.db = sqlite3.connect(db_path)
-        self.cursor = self.db.cursor()
-        self.cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS StickerPrices (
-                name TEXT PRIMARY KEY,
-                price REAL
+        self.lock = threading.RLock()
+        self.db = sqlite3.connect(db_path, check_same_thread=False)
+        with self.lock:
+            self.db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS StickerPrices (
+                    name TEXT PRIMARY KEY,
+                    price REAL
+                )
+                """
             )
-            """
-        )
-        self.db.commit()
+            self.db.commit()
 
     def update_price(self, sticker_name: str, price: float) -> None:
-        self.cursor.execute(
-            "INSERT OR REPLACE INTO StickerPrices (name, price) VALUES (?, ?)",
-            (sticker_name, price),
-        )
-        self.db.commit()
+        with self.lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO StickerPrices (name, price) VALUES (?, ?)",
+                (sticker_name, price),
+            )
+            self.db.commit()
 
     def get_price_by_name(self, item_name: str) -> float:
-        price = self.cursor.execute(
-            "SELECT price FROM StickerPrices WHERE name LIKE ?",
-            (f"%{item_name}",),
-        ).fetchone()
-        return float(price[0]) if price else 0
+        with self.lock:
+            price = self.db.execute(
+                "SELECT price FROM StickerPrices WHERE name LIKE ?",
+                (f"%{item_name}",),
+            ).fetchone()
+            return float(price[0]) if price else 0
 
 
 class IItemPriceFetcher(Protocol):

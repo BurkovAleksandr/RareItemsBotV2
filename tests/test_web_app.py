@@ -1,6 +1,6 @@
 import pytest
 
-from web_app import parse_track_items
+from web_app import BotWebHandler, parse_track_items
 
 
 pytestmark = pytest.mark.mock
@@ -33,3 +33,14 @@ def test_parse_track_items_expands_exteriors():
 
     assert len(items) == 5
     assert items[0][0] == "AK-47 | Slate (Factory New)"
+
+
+def test_secret_config_field_does_not_render_value():
+    rendered = BotWebHandler.render_config_field(
+        object(),
+        {"API_KEY": "super-secret"},
+        ("API_KEY", "Steam API key", "password", ""),
+    )
+
+    assert "super-secret" not in rendered
+    assert 'placeholder="unchanged"' in rendered

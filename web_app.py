@@ -27,7 +27,7 @@ if LOCAL_SITE_PACKAGES.exists() and str(LOCAL_SITE_PACKAGES) not in sys.path:
 
 
 CONFIG_FIELDS = [
-    ("API_KEY", "Steam API key", "text", ""),
+    ("API_KEY", "Steam API key", "password", ""),
     ("PARSER_LOGIN", "Parser login", "text", ""),
     ("PARSER_PASSWORD", "Parser password", "password", ""),
     ("PARSER_MAFILE", "Parser maFile", "text", "./mafiles/parser.maFile"),
@@ -46,6 +46,7 @@ CONFIG_FIELDS = [
     ("DB_PATH", "SQLite DB path", "text", "./db.db"),
     ("PROXIES_PATH", "Proxy file path", "text", "./proxies.txt"),
 ]
+SECRET_FIELDS = {"API_KEY", "PARSER_PASSWORD", "BUYER_PASSWORD"}
 
 
 def build_market_url(item_name: str) -> str:
@@ -134,6 +135,7 @@ class AsyncBotController:
         self.thread.start()
         self.lock = threading.RLock()
         self.task: asyncio.Task | None = None
+        self.bot = None
         self.startup_future = None
         self.started_at: datetime | None = None
         self.last_error: str | None = None
@@ -171,6 +173,7 @@ class AsyncBotController:
 
         runtime_config = load_runtime_config(self.config_path)
         bot = await create_bot(runtime_config)
+        self.bot = bot
         task = self.loop.create_task(bot.start())
         task.add_done_callback(self._bot_done)
         with self.lock:
@@ -205,6 +208,7 @@ class AsyncBotController:
         with self.lock:
             self.running = False
             self.starting = False
+            self.bot = None
             if error:
                 self.last_error = error
 
@@ -224,15 +228,26 @@ class AsyncBotController:
     async def _stop_bot(self) -> None:
         with self.lock:
             task = self.task
+            bot = self.bot
+
+        if bot:
+            bot.stop()
+
         if task and not task.done():
-            task.cancel()
             try:
-                await task
+                await asyncio.wait_for(task, timeout=15)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             except asyncio.CancelledError:
                 pass
         with self.lock:
             self.running = False
             self.starting = False
+            self.bot = None
 
     def shutdown(self) -> None:
         try:
@@ -316,7 +331,10 @@ class BotWebHandler(BaseHTTPRequestHandler):
                 raw_value = form.get(name, default)
                 config[name] = float(raw_value) if str(raw_value).strip() else 0
             else:
-                config[name] = form.get(name, default)
+                raw_value = form.get(name, default)
+                if name in SECRET_FIELDS and not str(raw_value).strip() and name in config:
+                    continue
+                config[name] = raw_value
 
         write_config_data(self.config_path, config)
         return "Конфиг сохранен."
@@ -580,6 +598,7 @@ class BotWebHandler(BaseHTTPRequestHandler):
     def render_config_field(self, config: dict, field: tuple[str, str, str, Any]) -> str:
         name, label, field_type, default = field
         value = config_value(config, name, default)
+        is_secret = name in SECRET_FIELDS
         escaped_name = html.escape(name)
         escaped_label = html.escape(label)
 
@@ -593,11 +612,13 @@ class BotWebHandler(BaseHTTPRequestHandler):
             )
 
         step = ' step="0.01"' if field_type == "number" else ""
+        input_value = "" if is_secret else str(value)
+        placeholder = ' placeholder="unchanged"' if is_secret and value else ""
         return (
             '<div class="field">'
             f"<label for=\"{escaped_name}\">{escaped_label}</label>"
             f"<input id=\"{escaped_name}\" name=\"{escaped_name}\" type=\"{field_type}\""
-            f"{step} value=\"{html.escape(str(value), quote=True)}\">"
+            f"{step}{placeholder} value=\"{html.escape(input_value, quote=True)}\">"
             "</div>"
         )
 

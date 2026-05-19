@@ -40,3 +40,20 @@ def test_runtime_config_accepts_string_booleans():
 
     assert config.use_proxies is False
     assert config.autobuy is True
+
+
+def test_runtime_config_resolves_env_reference(monkeypatch):
+    monkeypatch.setenv("TEST_STEAM_API_KEY", "key-from-env")
+    config = RuntimeConfig.from_dict(
+        {
+            "API_KEY": "env:TEST_STEAM_API_KEY",
+            "PARSER_LOGIN": "parser",
+            "PARSER_PASSWORD": "parser-pass",
+            "PARSER_MAFILE": "parser.maFile",
+            "BUYER_LOGIN": "buyer",
+            "BUYER_PASSWORD": "buyer-pass",
+            "BUYER_MAFILE": "buyer.maFile",
+        }
+    )
+
+    assert config.api_key == "key-from-env"
