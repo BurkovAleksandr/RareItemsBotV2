@@ -73,8 +73,7 @@ class AsyncSteamBot:
             return False
 
     async def get_items_from_market(self, item_url: str) -> list[dict]:
-        raw_data = await self.parser.get_raw_data_from_market(item_url)
-        json_data = self.parser.extract_json_from_raw_data(raw_data)
+        json_data = await self.parser.get_listing_info_from_market(item_url)
         return self.parser.extract_item_data(json_data)
 
     async def create_one_task(self, item_name: str, item_url: str, delay: float) -> None:
@@ -82,8 +81,8 @@ class AsyncSteamBot:
             return
         try:
             listings = await self.get_items_from_market(item_url)
-        except Exception:
-            logger.exception("Failed to fetch market listings for %s", item_name)
+        except Exception as exc:
+            logger.warning("Failed to fetch market listings for %s: %s", item_name, exc)
             return
         if self._stop_requested():
             return
