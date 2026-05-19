@@ -185,7 +185,11 @@ def summarize_market_page(raw_data: str) -> str:
     )
     lowered = raw_data.lower()
     hints = []
-    if "login" in lowered or "sign in" in lowered:
+    userinfo = soup.find(attrs={"data-userinfo": True})
+    data_userinfo = userinfo.get("data-userinfo", "") if userinfo else ""
+    if '"logged_in":false' in data_userinfo or (
+        "global_action_link" in lowered and "sign in" in lowered
+    ):
         hints.append("login")
     if "too many requests" in lowered:
         hints.append("rate_limit")
@@ -237,6 +241,10 @@ class AsyncParser:
 
     @secundomer
     async def get_raw_data_from_market(self, url: str) -> str:
+        text, _ = await self._fetch_raw_data_from_market(url)
+        return text
+
+    async def _fetch_raw_data_from_market(self, url: str) -> tuple[str, str]:
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             proxy = (
@@ -252,7 +260,8 @@ class AsyncParser:
                     )
                     text = await response.text()
                     self._save_debug_response(text)
-                    final_url = str(getattr(response, "url", url))
+                    response_url = getattr(response, "url", None)
+                    final_url = str(response_url) if response_url else url
                     if final_url != url:
                         logger.warning(
                             "Steam market page redirected from %s to %s",
@@ -260,7 +269,7 @@ class AsyncParser:
                             final_url,
                         )
                     if response.status == 200:
-                        return text
+                        return text, final_url
 
                     logger.warning(
                         "Steam market page returned HTTP %s for %s on attempt %s/%s",
@@ -270,7 +279,7 @@ class AsyncParser:
                         self.max_retries,
                     )
                     if response.status not in self.retry_statuses:
-                        return text
+                        return text, final_url
             except Exception as exc:
                 last_error = exc
                 logger.warning(
@@ -350,17 +359,18 @@ class AsyncParser:
         )
 
     async def get_listing_info_from_market(self, url: str) -> dict[str, Any]:
-        raw_data = await self.get_raw_data_from_market(url)
+        raw_data, final_url = await self._fetch_raw_data_from_market(url)
         try:
             listing_info = self.extract_json_from_raw_data(raw_data)
             return merge_listing_assets(listing_info, _extract_assets_info(raw_data))
         except ListingInfoNotFound:
             logger.warning(
-                "Steam market page did not contain g_rgListingInfo for %s; falling back to render endpoint (%s)",
+                "Steam market page did not contain g_rgListingInfo for %s; falling back to render endpoint via %s (%s)",
                 url,
+                final_url,
                 summarize_market_page(raw_data),
             )
-            render_payload = await self.get_json_from_market_render(url)
+            render_payload = await self.get_json_from_market_render(final_url)
             return merge_render_assets(render_payload)
 
     def extract_json_from_raw_data(self, raw_data: str) -> dict[str, Any]:

@@ -10,9 +10,10 @@ pytestmark = pytest.mark.mock
 
 
 class FakeResponse:
-    def __init__(self, status: int, text: str):
+    def __init__(self, status: int, text: str, url: str | None = None):
         self.status = status
         self._text = text
+        self.url = url
 
     async def text(self):
         return self._text
@@ -132,6 +133,42 @@ def test_async_parser_falls_back_to_render_endpoint_when_listing_info_missing():
             "charm": {},
         }
     ]
+
+
+def test_async_parser_uses_final_redirect_url_for_render_fallback():
+    payload = {
+        "success": True,
+        "listinginfo": {
+            "123": {
+                "converted_price": 100,
+                "converted_fee": 15,
+                "asset": {"appid": 730, "contextid": "2", "id": "asset-1"},
+            }
+        },
+        "assets": {},
+    }
+    original_url = (
+        "https://steamcommunity.com/market/listings/730/"
+        "AK-47%20%7C%20Slate%20%28Field-Tested%29"
+    )
+    final_url = "https://steamcommunity.com/market/listings/730/G1807208B083004"
+    session = FakeSteamSession(
+        [
+            FakeResponse(
+                200,
+                "<html><title>AK-47 | Slate - Steam Community Market</title></html>",
+                url=final_url,
+            ),
+            FakeResponse(200, json.dumps(payload)),
+        ]
+    )
+    parser = AsyncParser(session, request_timeout=1, max_retries=1, retry_base_delay=0)
+
+    listing_info = asyncio.run(parser.get_listing_info_from_market(original_url))
+
+    assert listing_info == payload["listinginfo"]
+    assert session.requests[1]["args"][0].startswith(f"{final_url}/render?")
+    assert session.requests[1]["kwargs"]["headers"] == {"Referer": final_url}
 
 
 def test_merge_render_assets_keeps_listing_without_asset_description():
