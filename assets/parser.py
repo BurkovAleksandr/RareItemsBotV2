@@ -195,9 +195,11 @@ def normalize_market_search_payload(
 
         asset = dict(description)
         asset.update(listing.get("asset") or {})
-        asset["market_actions"] = description.get("market_actions") or description.get(
-            "actions"
-        ) or asset.get("market_actions")
+        asset["market_actions"] = (
+            description.get("market_actions")
+            or description.get("actions")
+            or asset.get("market_actions")
+        )
 
         listing_info[listing_id] = {
             **listing,
@@ -274,9 +276,11 @@ def _extract_accessories(asset: dict[str, Any], kind: str) -> list[dict[str, Any
     accessories = []
     for accessory in asset.get("accessory_properties") or []:
         description = accessory.get("description") or {}
-        market_name = description.get("market_hash_name") or description.get(
-            "market_name"
-        ) or description.get("name")
+        market_name = (
+            description.get("market_hash_name")
+            or description.get("market_name")
+            or description.get("name")
+        )
         item_type = description.get("type") or ""
         if kind not in item_type and not str(market_name or "").startswith(f"{kind} |"):
             continue
@@ -297,7 +301,9 @@ def _extract_accessories(asset: dict[str, Any], kind: str) -> list[dict[str, Any
 
 
 def extract_stickers(asset: dict[str, Any]) -> list[dict[str, str]]:
-    stickers = _extract_titled_images(_description_html(asset, "sticker_info"), "Sticker:")
+    stickers = _extract_titled_images(
+        _description_html(asset, "sticker_info"), "Sticker:"
+    )
     return stickers or _extract_accessories(asset, "Sticker")
 
 
@@ -406,7 +412,7 @@ class AsyncParser:
                         ssl=False,
                         timeout=self.request_timeout,
                     )
-                    text = await response.text()
+                    text = await response.text(encoding="utf-8", errors="replace")
                     self._save_debug_response(text)
                     response_url = getattr(response, "url", None)
                     final_url = str(response_url) if response_url else url
@@ -465,7 +471,7 @@ class AsyncParser:
                         timeout=self.request_timeout,
                         headers={"Referer": url},
                     )
-                    text = await response.text()
+                    text = await response.text(encoding="utf-8", errors="replace")
                     if response.status == 200:
                         try:
                             payload = json.loads(text)
@@ -542,7 +548,15 @@ class AsyncParser:
                             "x-valve-request-type": "routeAction",
                         },
                     )
-                    text = await response.text()
+                    logger.debug(
+                        "Steam market search POST to %s with body %s returned HTTP %s on attempt %s/%s",
+                        search_url,
+                        body,
+                        response.status,
+                        attempt,
+                        self.max_retries,
+                    )
+                    text = await response.text(encoding="utf-8", errors="replace")
                     if response.status == 200:
                         try:
                             payload = json.loads(text)
@@ -554,6 +568,7 @@ class AsyncParser:
                             raise RuntimeError(
                                 f"Steam market search returned no listings for {search_url}"
                             )
+                        payload.pop("facets", None)
                         return payload
 
                     logger.warning(
@@ -586,7 +601,19 @@ class AsyncParser:
             f"Could not fetch Steam market search after {self.max_retries} attempts"
         )
 
-    async def get_listing_info_from_market(self, url: str) -> dict[str, Any]:
+    async def _get_listing_info_from_market_search(
+        self, url: str, requested_market_name: str
+    ) -> dict[str, Any]:
+        search_payload = await self.get_json_from_market_search(
+            url,
+            requested_market_name=requested_market_name,
+        )
+        return normalize_market_search_payload(
+            search_payload,
+            requested_market_name=requested_market_name,
+        )
+
+    async def _get_listing_info_from_market_legacy(self, url: str) -> dict[str, Any]:
         raw_data, final_url = await self._fetch_raw_data_from_market(url)
         try:
             listing_info = self.extract_json_from_raw_data(raw_data)
@@ -625,6 +652,29 @@ class AsyncParser:
 
             render_payload = await self.get_json_from_market_render(final_url)
             return merge_render_assets(render_payload)
+
+    async def get_listing_info_from_market(self, url: str) -> dict[str, Any]:
+        requested_market_name = requested_market_name_from_listing_url(url)
+        try:
+            listing_info = await self._get_listing_info_from_market_search(
+                url,
+                requested_market_name=requested_market_name,
+            )
+            if listing_info or not requested_market_name:
+                return listing_info
+            logger.warning(
+                "Steam market search returned no listings matching %s via %s",
+                requested_market_name,
+                url,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Direct Steam market search failed for %s: %s; falling back to legacy URL resolution",
+                url,
+                exc,
+            )
+
+        return await self._get_listing_info_from_market_legacy(url)
 
     def extract_json_from_raw_data(self, raw_data: str) -> dict[str, Any]:
         return _extract_listing_info(raw_data)

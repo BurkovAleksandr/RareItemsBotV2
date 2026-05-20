@@ -23,7 +23,7 @@ class FakeResponse:
         self._text = text
         self.url = url
 
-    async def text(self):
+    async def text(self, *args, **kwargs):
         return self._text
 
 
@@ -147,6 +147,7 @@ def test_async_parser_falls_back_to_render_endpoint_when_listing_info_missing():
     }
     session = FakeSteamSession(
         [
+            FakeResponse(500, "new market search unavailable"),
             FakeResponse(200, "<html><title>Steam Community</title></html>"),
             FakeResponse(500, "new market search unavailable"),
             FakeResponse(200, json.dumps(payload)),
@@ -161,10 +162,12 @@ def test_async_parser_falls_back_to_render_endpoint_when_listing_info_missing():
     )
     items = parser.extract_item_data(listing_info)
 
-    assert session.calls == 3
-    assert session.requests[1]["method"] == "POST"
-    assert session.requests[2]["method"] == "GET"
-    assert "/render?" in session.requests[2]["args"][0]
+    assert session.calls == 4
+    assert session.requests[0]["method"] == "POST"
+    assert session.requests[1]["method"] == "GET"
+    assert session.requests[2]["method"] == "POST"
+    assert session.requests[3]["method"] == "GET"
+    assert "/render?" in session.requests[3]["args"][0]
     assert items == [
         {
             "listing_id": "123",
@@ -232,11 +235,6 @@ def test_async_parser_uses_new_market_search_before_render_fallback():
     }
     session = FakeSteamSession(
         [
-            FakeResponse(
-                200,
-                "<html><title>AK-47 | Slate</title></html>",
-                url="https://steamcommunity.com/market/listings/730/G1807208B083004",
-            ),
             FakeResponse(200, json.dumps(payload)),
         ]
     )
@@ -249,9 +247,9 @@ def test_async_parser_uses_new_market_search_before_render_fallback():
     )
     items = parser.extract_item_data(listing_info)
 
-    assert session.requests[1]["method"] == "POST"
-    assert session.requests[1]["args"][0] == "https://steamcommunity.com/market/listings/730/G1807208B083004"
-    assert session.requests[1]["kwargs"]["json"][0]["filters"] == {
+    assert session.requests[0]["method"] == "POST"
+    assert session.requests[0]["args"][0] == "https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29"
+    assert session.requests[0]["kwargs"]["json"][0]["filters"] == {
         "Quality": ["normal"],
         "Exterior": ["WearCategory2"],
     }
@@ -333,6 +331,7 @@ def test_async_parser_uses_final_redirect_url_for_render_fallback():
     final_url = "https://steamcommunity.com/market/listings/730/G1807208B083004"
     session = FakeSteamSession(
         [
+            FakeResponse(500, "direct market search unavailable"),
             FakeResponse(
                 200,
                 "<html><title>AK-47 | Slate - Steam Community Market</title></html>",
@@ -347,10 +346,12 @@ def test_async_parser_uses_final_redirect_url_for_render_fallback():
     listing_info = asyncio.run(parser.get_listing_info_from_market(original_url))
 
     assert listing_info == payload["listinginfo"]
-    assert session.requests[1]["method"] == "POST"
-    assert session.requests[1]["args"][0] == final_url
-    assert session.requests[2]["args"][0].startswith(f"{final_url}/render?")
-    assert session.requests[2]["kwargs"]["headers"] == {"Referer": final_url}
+    assert session.requests[0]["method"] == "POST"
+    assert session.requests[1]["method"] == "GET"
+    assert session.requests[2]["method"] == "POST"
+    assert session.requests[2]["args"][0] == final_url
+    assert session.requests[3]["args"][0].startswith(f"{final_url}/render?")
+    assert session.requests[3]["kwargs"]["headers"] == {"Referer": final_url}
 
 
 def test_merge_render_assets_keeps_listing_without_asset_description():
@@ -408,7 +409,12 @@ def test_async_parser_extracts_market_page_asset_metadata():
         f"var g_rgListingInfo = {json.dumps(listing_info)};\n"
         "</script>"
     )
-    session = FakeSteamSession([FakeResponse(200, html)])
+    session = FakeSteamSession(
+        [
+            FakeResponse(500, "direct market search unavailable"),
+            FakeResponse(200, html),
+        ]
+    )
     parser = AsyncParser(session, request_timeout=1, max_retries=1, retry_base_delay=0)
 
     parsed_listing_info = asyncio.run(
