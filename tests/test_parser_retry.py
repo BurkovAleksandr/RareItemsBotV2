@@ -1,17 +1,10 @@
 import asyncio
+import codecs
 import json
 
 import pytest
 
-from assets.parser import (
-    AsyncParser,
-    build_market_filters_from_name,
-    build_market_render_url,
-    build_market_search_body,
-    merge_render_assets,
-    normalize_market_search_payload,
-    requested_market_name_from_listing_url,
-)
+from assets.parser import AsyncParser, normalize_new_market_listings
 
 
 pytestmark = pytest.mark.mock
@@ -43,9 +36,7 @@ class FakeClientSession:
         return self.owner.responses.pop(0)
 
     async def post(self, *args, **kwargs):
-        self.owner.calls += 1
-        self.owner.requests.append({"method": "POST", "args": args, "kwargs": kwargs})
-        return self.owner.responses.pop(0)
+        raise AssertionError("Market parser must not use POST requests")
 
 
 class FakeSteamSession:
@@ -58,6 +49,13 @@ class FakeSteamSession:
         return FakeClientSession(self)
 
 
+def _escaped_market_html(listings: list[dict]) -> str:
+    payload = json.dumps({"state": {"data": {"pages": [{"listings": listings}]}}})
+    escaped = codecs.encode(payload, "unicode_escape").decode("ascii")
+    escaped = codecs.encode(escaped, "unicode_escape").decode("ascii")
+    return f"<html><script>{escaped}</script></html>"
+
+
 def test_async_parser_retries_rate_limited_market_request():
     session = FakeSteamSession(
         [
@@ -67,133 +65,20 @@ def test_async_parser_retries_rate_limited_market_request():
     )
     parser = AsyncParser(session, request_timeout=1, max_retries=2, retry_base_delay=0)
 
-    text = asyncio.run(parser.get_raw_data_from_market("https://steamcommunity.com/market/listings/730/Test"))
+    text = asyncio.run(
+        parser.get_raw_data_from_market(
+            "https://steamcommunity.com/market/listings/730/Test"
+        )
+    )
 
     assert text == "ok"
     assert session.calls == 2
+    assert [request["method"] for request in session.requests] == ["GET", "GET"]
 
 
-def test_build_market_render_url():
-    render_url = build_market_render_url(
-        "https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29"
-    )
-
-    assert render_url.startswith(
-        "https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29/render?"
-    )
-    assert "start=0" in render_url
-    assert "count=10" in render_url
-    assert "currency=5" in render_url
-
-
-def test_build_market_search_body_uses_exact_item_filters():
-    body = build_market_search_body(
-        "https://steamcommunity.com/market/listings/730/G1807208B083004",
-        requested_market_name="AK-47 | Slate (Field-Tested)",
-    )
-
-    assert body == [
-        {
-            "appid": 730,
-            "strItemName": "G1807208B083004",
-            "filters": {"Quality": ["normal"], "Exterior": ["WearCategory2"]},
-            "accessoryFilters": {},
-            "propertyFilters": {},
-            "start": 0,
-        }
-    ]
-
-
-def test_build_market_filters_from_name_handles_stattrak_exterior():
-    assert build_market_filters_from_name("StatTrak™ AK-47 | Slate (Well-Worn)") == {
-        "Quality": ["strange"],
-        "Exterior": ["WearCategory3"],
-    }
-
-
-def test_requested_market_name_ignores_new_market_group_ids():
-    assert (
-        requested_market_name_from_listing_url(
-            "https://steamcommunity.com/market/listings/730/G1807208B083004"
-        )
-        == ""
-    )
-
-
-def test_async_parser_falls_back_to_render_endpoint_when_listing_info_missing():
-    payload = {
-        "success": True,
-        "listinginfo": {
-            "123": {
-                "converted_price": 100,
-                "converted_fee": 15,
-                "asset": {"appid": 730, "contextid": "2", "id": "asset-1"},
-            }
-        },
-        "assets": {
-            "730": {
-                "2": {
-                    "asset-1": {
-                        "market_actions": [
-                            {
-                                "link": "steam://inspect/%listingid%/%assetid%",
-                                "name": "Inspect in Game...",
-                            }
-                        ]
-                    }
-                }
-            }
-        },
-    }
-    session = FakeSteamSession(
+def test_normalize_new_market_listings_maps_new_page_shape():
+    listing_info = normalize_new_market_listings(
         [
-            FakeResponse(500, "new market search unavailable"),
-            FakeResponse(200, "<html><title>Steam Community</title></html>"),
-            FakeResponse(500, "new market search unavailable"),
-            FakeResponse(200, json.dumps(payload)),
-        ]
-    )
-    parser = AsyncParser(session, request_timeout=1, max_retries=1, retry_base_delay=0)
-
-    listing_info = asyncio.run(
-        parser.get_listing_info_from_market(
-            "https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29"
-        )
-    )
-    items = parser.extract_item_data(listing_info)
-
-    assert session.calls == 4
-    assert session.requests[0]["method"] == "POST"
-    assert session.requests[1]["method"] == "GET"
-    assert session.requests[2]["method"] == "POST"
-    assert session.requests[3]["method"] == "GET"
-    assert "/render?" in session.requests[3]["args"][0]
-    assert items == [
-        {
-            "listing_id": "123",
-            "inspect_link": "steam://inspect/123/asset-1",
-            "price": 115,
-            "price_no_fee": 100,
-            "fee": 15,
-            "asset_id": "asset-1",
-            "appid": 730,
-            "contextid": "2",
-            "market_name": "",
-            "float_value": None,
-            "pattern_template": None,
-            "item_certificate": None,
-            "stickers": [],
-            "charm": {},
-        }
-    ]
-
-
-def test_async_parser_uses_new_market_search_before_render_fallback():
-    payload = {
-        "more": True,
-        "start": 0,
-        "total_count": 1,
-        "listings": [
             {
                 "listingid": "listing-1",
                 "unPrice": 37090,
@@ -231,28 +116,12 @@ def test_async_parser_uses_new_market_search_before_render_fallback():
                     ],
                 },
             }
-        ],
-    }
-    session = FakeSteamSession(
-        [
-            FakeResponse(200, json.dumps(payload)),
         ]
     )
-    parser = AsyncParser(session, request_timeout=1, max_retries=1, retry_base_delay=0)
 
-    listing_info = asyncio.run(
-        parser.get_listing_info_from_market(
-            "https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29"
-        )
-    )
+    parser = AsyncParser(FakeSteamSession([]), request_timeout=1)
     items = parser.extract_item_data(listing_info)
 
-    assert session.requests[0]["method"] == "POST"
-    assert session.requests[0]["args"][0] == "https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29"
-    assert session.requests[0]["kwargs"]["json"][0]["filters"] == {
-        "Quality": ["normal"],
-        "Exterior": ["WearCategory2"],
-    }
     assert items == [
         {
             "listing_id": "listing-1",
@@ -280,170 +149,56 @@ def test_async_parser_uses_new_market_search_before_render_fallback():
     ]
 
 
-def test_normalize_market_search_payload_filters_mixed_bucket_listings():
-    payload = {
-        "listings": [
-            {
-                "listingid": "1",
-                "unPrice": 100,
-                "unFee": 15,
-                "eCurrency": 5,
-                "description": {"market_hash_name": "AK-47 | Slate (Battle-Scarred)"},
-                "asset": {"id": "asset-1"},
+def test_async_parser_gets_market_page_and_parses_embedded_listings():
+    listings = [
+        {
+            "listingid": "listing-1",
+            "unPrice": 100,
+            "unFee": 15,
+            "eCurrency": 5,
+            "description": {
+                "market_hash_name": "AK-47 | Slate (Field-Tested)",
+                "market_actions": [
+                    {
+                        "link": "steam://inspect/%listingid%/%assetid%",
+                        "name": "Inspect in Game...",
+                    }
+                ],
             },
-            {
-                "listingid": "2",
-                "unPrice": 200,
-                "unFee": 30,
-                "eCurrency": 5,
-                "description": {"market_hash_name": "AK-47 | Slate (Field-Tested)"},
-                "asset": {"id": "asset-2"},
+            "asset": {
+                "appid": 730,
+                "contextid": "2",
+                "id": "asset-1",
+                "asset_properties": [
+                    {"propertyid": 1, "int_value": "570"},
+                    {"propertyid": 2, "float_value": "0.359291106462478638"},
+                    {"propertyid": 6, "string_value": "certificate"},
+                ],
             },
-        ]
-    }
-
-    listing_info = normalize_market_search_payload(
-        payload,
-        requested_market_name="AK-47 | Slate (Field-Tested)",
-    )
-
-    assert list(listing_info) == ["2"]
-    assert listing_info["2"]["converted_price"] == 200
-    assert listing_info["2"]["converted_fee"] == 30
-
-
-def test_async_parser_uses_final_redirect_url_for_render_fallback():
-    payload = {
-        "success": True,
-        "listinginfo": {
-            "123": {
-                "converted_price": 100,
-                "converted_fee": 15,
-                "asset": {"appid": 730, "contextid": "2", "id": "asset-1"},
-            }
-        },
-        "assets": {},
-    }
-    original_url = (
-        "https://steamcommunity.com/market/listings/730/"
-        "AK-47%20%7C%20Slate%20%28Field-Tested%29"
-    )
-    final_url = "https://steamcommunity.com/market/listings/730/G1807208B083004"
+        }
+    ]
     session = FakeSteamSession(
         [
-            FakeResponse(500, "direct market search unavailable"),
             FakeResponse(
                 200,
-                "<html><title>AK-47 | Slate - Steam Community Market</title></html>",
-                url=final_url,
-            ),
-            FakeResponse(500, "new market search unavailable"),
-            FakeResponse(200, json.dumps(payload)),
+                _escaped_market_html(listings),
+                url="https://steamcommunity.com/market/listings/730/G1807208B083004",
+            )
         ]
     )
     parser = AsyncParser(session, request_timeout=1, max_retries=1, retry_base_delay=0)
 
-    listing_info = asyncio.run(parser.get_listing_info_from_market(original_url))
-
-    assert listing_info == payload["listinginfo"]
-    assert session.requests[0]["method"] == "POST"
-    assert session.requests[1]["method"] == "GET"
-    assert session.requests[2]["method"] == "POST"
-    assert session.requests[2]["args"][0] == final_url
-    assert session.requests[3]["args"][0].startswith(f"{final_url}/render?")
-    assert session.requests[3]["kwargs"]["headers"] == {"Referer": final_url}
-
-
-def test_merge_render_assets_keeps_listing_without_asset_description():
-    payload = {"listinginfo": {"123": {"asset": {"appid": 730, "contextid": "2", "id": "missing"}}}}
-
-    assert merge_render_assets(payload) == payload["listinginfo"]
-
-
-def test_async_parser_extracts_market_page_asset_metadata():
-    assets = {
-        "730": {
-            "2": {
-                "asset-1": {
-                    "appid": 730,
-                    "contextid": "2",
-                    "id": "asset-1",
-                    "market_hash_name": "AK-47 | Slate (Field-Tested)",
-                    "market_actions": [
-                        {"link": "steam://inspect/%listingid%/%assetid%", "name": "Inspect in Game..."}
-                    ],
-                    "asset_properties": [
-                        {"propertyid": 1, "int_value": "570"},
-                        {"propertyid": 2, "float_value": "0.359291106462478638"},
-                        {"propertyid": 6, "string_value": "certificate"},
-                    ],
-                    "descriptions": [
-                        {
-                            "type": "html",
-                            "name": "sticker_info",
-                            "value": (
-                                '<div><img src="sticker.png" '
-                                'title="Sticker: Bad News Eagles (Glitter) | Paris 2023"></div>'
-                            ),
-                        },
-                        {
-                            "type": "html",
-                            "name": "keychain_info",
-                            "value": '<div><img src="charm.png" title="Charm: Biomech"></div>',
-                        },
-                    ],
-                }
-            }
-        }
-    }
-    listing_info = {
-        "listing-1": {
-            "converted_price": 100,
-            "converted_fee": 15,
-            "asset": {"appid": 730, "contextid": "2", "id": "asset-1"},
-        }
-    }
-    html = (
-        '<script type="text/javascript">'
-        f"var g_rgAssets = {json.dumps(assets)};\n"
-        f"var g_rgListingInfo = {json.dumps(listing_info)};\n"
-        "</script>"
-    )
-    session = FakeSteamSession(
-        [
-            FakeResponse(500, "direct market search unavailable"),
-            FakeResponse(200, html),
-        ]
-    )
-    parser = AsyncParser(session, request_timeout=1, max_retries=1, retry_base_delay=0)
-
-    parsed_listing_info = asyncio.run(
+    listing_info = asyncio.run(
         parser.get_listing_info_from_market(
             "https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29"
         )
     )
-    items = parser.extract_item_data(parsed_listing_info)
+    items = parser.extract_item_data(listing_info)
 
-    assert items == [
-        {
-            "listing_id": "listing-1",
-            "inspect_link": "steam://inspect/listing-1/asset-1",
-            "price": 115,
-            "price_no_fee": 100,
-            "fee": 15,
-            "asset_id": "asset-1",
-            "appid": 730,
-            "contextid": "2",
-            "market_name": "AK-47 | Slate (Field-Tested)",
-            "float_value": 0.35929110646247864,
-            "pattern_template": 570,
-            "item_certificate": "certificate",
-            "stickers": [
-                {
-                    "name": "Bad News Eagles (Glitter) | Paris 2023",
-                    "icon_url": "sticker.png",
-                }
-            ],
-            "charm": {"name": "Biomech", "icon_url": "charm.png"},
-        }
-    ]
+    assert [request["method"] for request in session.requests] == ["GET"]
+    assert items[0]["listing_id"] == "listing-1"
+    assert items[0]["inspect_link"] == "steam://inspect/listing-1/asset-1"
+    assert items[0]["price"] == 115
+    assert items[0]["float_value"] == 0.35929110646247864
+    assert items[0]["pattern_template"] == 570
+    assert items[0]["item_certificate"] == "certificate"
