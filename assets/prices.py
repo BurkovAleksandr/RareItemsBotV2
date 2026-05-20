@@ -7,7 +7,7 @@ import re
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol
 
 import requests
@@ -25,6 +25,9 @@ class IPricesRepository(Protocol):
         pass
 
     def update_price(self, item_name: str, price: float) -> None:
+        pass
+
+    def is_price_recent(self, item_name: str, max_age_hours: float) -> bool:
         pass
 
 
@@ -66,6 +69,22 @@ class PricesRepository(IPricesRepository):
             ).fetchone()
             return float(price[0]) if price else 0
 
+    def is_price_recent(self, item_name: str, max_age_hours: float) -> bool:
+        if max_age_hours <= 0:
+            return False
+        with self.lock:
+            row = self.db.execute(
+                "SELECT updated_at FROM StickerPrices WHERE name = ?",
+                (item_name,),
+            ).fetchone()
+        if not row or not row[0]:
+            return False
+        try:
+            updated_at = datetime.fromisoformat(str(row[0]))
+        except ValueError:
+            return False
+        return datetime.now() - updated_at < timedelta(hours=max_age_hours)
+
 
 @dataclass(frozen=True)
 class PriceEntry:
@@ -79,6 +98,9 @@ class IPriceProvider(Protocol):
     name: str
 
     def fetch_prices(self) -> list[PriceEntry]:
+        pass
+
+    def iter_price_pages(self) -> list[PriceEntry]:
         pass
 
 
@@ -102,6 +124,9 @@ class BaseHttpPriceProvider:
         response.raise_for_status()
         return response
 
+    def iter_price_pages(self):
+        yield self.fetch_prices()
+
 
 class SteamAnalystPriceProvider(BaseHttpPriceProvider):
     name = "steamanalyst"
@@ -118,6 +143,11 @@ class SteamAnalystPriceProvider(BaseHttpPriceProvider):
 
     def fetch_prices(self) -> list[PriceEntry]:
         entries: list[PriceEntry] = []
+        for page_entries in self.iter_price_pages():
+            entries.extend(page_entries)
+        return entries
+
+    def iter_price_pages(self):
         page = 1
         total_pages = self.max_pages
         while total_pages is None or page <= total_pages:
@@ -136,12 +166,12 @@ class SteamAnalystPriceProvider(BaseHttpPriceProvider):
             page_entries = self.parse_html(response.text)
             if not page_entries:
                 break
-            entries.extend(page_entries)
+            logger.info("Parsed %s sticker prices from %s page %s", len(page_entries), self.name, page)
+            yield page_entries
 
             if total_pages is None:
                 total_pages = self.extract_total_pages(response.text) or page
             page += 1
-        return entries
 
     def _page_url(self, page: int) -> str:
         return self.base_url if page <= 1 else f"{self.base_url}?page={page}"
@@ -284,6 +314,7 @@ class ItemPriceFetcher(IItemPriceFetcher):
         proxy_manager: ProxyManager | None = None,
         request_timeout: int = 20,
         providers: list[IPriceProvider] | None = None,
+        recent_price_max_age_hours: float = 24,
         **legacy_kwargs,
     ):
         self.repository = db_repository or legacy_kwargs.get("db_repostiotory")
@@ -291,6 +322,7 @@ class ItemPriceFetcher(IItemPriceFetcher):
             raise ValueError("db_repository is required")
         self.proxy_manager = proxy_manager
         self.request_timeout = request_timeout
+        self.recent_price_max_age_hours = float(recent_price_max_age_hours)
         self.providers = providers or [
             SteamAnalystPriceProvider(proxy_manager=proxy_manager, request_timeout=request_timeout),
             CsBackpackPriceProvider(proxy_manager=proxy_manager, request_timeout=request_timeout),
@@ -323,19 +355,43 @@ class ItemPriceFetcher(IItemPriceFetcher):
         last_error: Exception | None = None
         for provider in self.providers:
             try:
-                entries = provider.fetch_prices()
+                updated_count = 0
+                skipped_recent_count = 0
+                for entries in self._iter_provider_pages(provider):
+                    page_updated, page_skipped = self._update_entries(currency, entries)
+                    updated_count += page_updated
+                    skipped_recent_count += page_skipped
             except Exception as exc:
                 last_error = exc
                 logger.exception("Sticker price provider %s failed", provider.name)
                 continue
 
-            updated_count = 0
-            for entry in entries:
-                converted_price = currency.change_currency(entry.price_usd, 1001)
-                self.repository.update_price(entry.name, round(converted_price, 2))
-                updated_count += 1
-
-            logger.info("Updated %s sticker prices from %s", updated_count, provider.name)
+            logger.info(
+                "Updated %s sticker prices from %s; skipped recent: %s",
+                updated_count,
+                provider.name,
+                skipped_recent_count,
+            )
             return updated_count
 
         raise RuntimeError("All sticker price providers failed") from last_error
+
+    def _iter_provider_pages(self, provider: IPriceProvider):
+        iter_pages = getattr(provider, "iter_price_pages", None)
+        if iter_pages:
+            yield from iter_pages()
+        else:
+            yield provider.fetch_prices()
+
+    def _update_entries(self, currency: Currency, entries: list[PriceEntry]) -> tuple[int, int]:
+        updated_count = 0
+        skipped_recent_count = 0
+        for entry in entries:
+            if self.repository.is_price_recent(entry.name, self.recent_price_max_age_hours):
+                skipped_recent_count += 1
+                continue
+
+            converted_price = currency.change_currency(entry.price_usd, 1001)
+            self.repository.update_price(entry.name, round(converted_price, 2))
+            updated_count += 1
+        return updated_count, skipped_recent_count

@@ -43,6 +43,7 @@ CONFIG_FIELDS = [
     ("USE_PROXIES", "Use proxies", "checkbox", False),
     ("REFRESH_CURRENCY_RATES", "Refresh currency rates", "checkbox", True),
     ("REFRESH_ITEM_PRICES", "Refresh sticker prices", "checkbox", False),
+    ("STICKER_PRICE_TTL_HOURS", "Sticker price TTL hours", "number", "24"),
     ("ACCOUNTS_DIR", "Accounts dir", "text", "./accounts/"),
     ("DB_PATH", "SQLite DB path", "text", "./db.db"),
     ("PROXIES_PATH", "Proxy file path", "text", "./proxies.txt"),

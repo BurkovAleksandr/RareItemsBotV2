@@ -16,5 +16,6 @@
   "USE_PROXIES": false,
   "PROXIES_PATH": "./proxies.txt",
   "REFRESH_CURRENCY_RATES": true,
-  "REFRESH_ITEM_PRICES": false
+  "REFRESH_ITEM_PRICES": false,
+  "STICKER_PRICE_TTL_HOURS": 24
 }

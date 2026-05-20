@@ -62,6 +62,7 @@ class RuntimeConfig:
     proxies_path: str = "./proxies.txt"
     refresh_currency_rates: bool = True
     refresh_item_prices: bool = False
+    sticker_price_ttl_hours: float = 24
 
     @classmethod
     def from_dict(cls, data: dict) -> "RuntimeConfig":
@@ -103,6 +104,7 @@ class RuntimeConfig:
             proxies_path=value("PROXIES_PATH", "./proxies.txt"),
             refresh_currency_rates=_config_bool(value("REFRESH_CURRENCY_RATES", True), default=True),
             refresh_item_prices=_config_bool(value("REFRESH_ITEM_PRICES", False)),
+            sticker_price_ttl_hours=float(value("STICKER_PRICE_TTL_HOURS", 24)),
         )
 
     def to_config_dict(self) -> dict[str, Any]:
@@ -125,6 +127,7 @@ class RuntimeConfig:
             "proxies_path": "PROXIES_PATH",
             "refresh_currency_rates": "REFRESH_CURRENCY_RATES",
             "refresh_item_prices": "REFRESH_ITEM_PRICES",
+            "sticker_price_ttl_hours": "STICKER_PRICE_TTL_HOURS",
         }
         data = asdict(self)
         return {config_name: data[field_name] for field_name, config_name in mapping.items()}
@@ -261,12 +264,16 @@ async def create_bot(runtime_config: RuntimeConfig, status_recorder=None):
     item_price_fetcher = ItemPriceFetcher(
         db_repository=price_repository,
         proxy_manager=proxy_manager,
+        recent_price_max_age_hours=runtime_config.sticker_price_ttl_hours,
     )
     if runtime_config.refresh_item_prices:
         if status_recorder:
             status_recorder.start_step(
                 "sticker_prices",
-                detail=f"Updating sticker prices via {', '.join(item_price_fetcher.provider_names)}",
+                detail=(
+                    f"Updating sticker prices via {', '.join(item_price_fetcher.provider_names)}; "
+                    f"TTL {runtime_config.sticker_price_ttl_hours:g}h"
+                ),
             )
         try:
             updated_count = await asyncio.to_thread(item_price_fetcher.update_all_prices, currency_rates)
