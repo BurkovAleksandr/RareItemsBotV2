@@ -6,7 +6,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
@@ -20,6 +20,17 @@ logger = logging.getLogger(__name__)
 
 class ListingInfoNotFound(ValueError):
     pass
+
+
+MARKET_SEARCH_ACTION_TYPE = os.getenv("MARKET_SEARCH_ACTION_TYPE", "4OPT6VBA:Search")
+
+EXTERIOR_FILTERS = {
+    "Factory New": "WearCategory0",
+    "Minimal Wear": "WearCategory1",
+    "Field-Tested": "WearCategory2",
+    "Well-Worn": "WearCategory3",
+    "Battle-Scarred": "WearCategory4",
+}
 
 
 def _extract_js_object(raw_data: str, variable_name: str) -> dict[str, Any]:
@@ -79,6 +90,71 @@ def build_market_render_url(
     return urlunparse(parsed._replace(path=path, query=urlencode(query)))
 
 
+def market_name_from_listing_url(listing_url: str) -> str:
+    path_parts = [part for part in urlparse(listing_url).path.split("/") if part]
+    if len(path_parts) < 4:
+        return ""
+    return unquote(path_parts[-1])
+
+
+def is_market_group_id(item_name: str) -> bool:
+    return len(item_name) > 1 and item_name.startswith("G") and item_name[1:].isalnum()
+
+
+def requested_market_name_from_listing_url(listing_url: str) -> str:
+    market_name = market_name_from_listing_url(listing_url)
+    return "" if is_market_group_id(market_name) else market_name
+
+
+def parse_market_listing_url(listing_url: str) -> tuple[int, str]:
+    path_parts = [part for part in urlparse(listing_url).path.split("/") if part]
+    if len(path_parts) < 4 or path_parts[-4:-2] != ["market", "listings"]:
+        raise ValueError(f"Unexpected Steam market listing URL: {listing_url}")
+    return int(path_parts[-2]), unquote(path_parts[-1])
+
+
+def build_market_filters_from_name(market_name: str) -> dict[str, list[str]]:
+    filters: dict[str, list[str]] = {}
+    if not market_name or is_market_group_id(market_name):
+        return filters
+
+    if market_name.startswith("StatTrak"):
+        filters["Quality"] = ["strange"]
+    elif market_name.startswith("Souvenir "):
+        filters["Quality"] = ["tournament"]
+    elif any(f"({exterior})" in market_name for exterior in EXTERIOR_FILTERS):
+        filters["Quality"] = ["normal"]
+
+    for exterior, filter_value in EXTERIOR_FILTERS.items():
+        if f"({exterior})" in market_name:
+            filters["Exterior"] = [filter_value]
+            break
+    return filters
+
+
+def build_market_search_body(
+    listing_url: str,
+    requested_market_name: str = "",
+    start: int = 0,
+) -> list[dict[str, Any]]:
+    app_id, item_name = parse_market_listing_url(listing_url)
+    return [
+        {
+            "appid": app_id,
+            "strItemName": item_name,
+            "filters": build_market_filters_from_name(requested_market_name),
+            "accessoryFilters": {},
+            "propertyFilters": {},
+            "start": start,
+        }
+    ]
+
+
+def build_market_search_url(listing_url: str) -> str:
+    parsed = urlparse(listing_url)
+    return urlunparse(parsed._replace(query="", fragment=""))
+
+
 def merge_render_assets(payload: dict[str, Any]) -> dict[str, Any]:
     listing_info = payload.get("listinginfo") or {}
     assets = payload.get("assets") or {}
@@ -101,12 +177,54 @@ def merge_listing_assets(
     return listing_info
 
 
+def normalize_market_search_payload(
+    payload: dict[str, Any], requested_market_name: str = ""
+) -> dict[str, Any]:
+    listing_info: dict[str, Any] = {}
+    for listing in payload.get("listings") or []:
+        listing_id = str(listing.get("listingid") or "")
+        if not listing_id:
+            continue
+
+        description = listing.get("description") or {}
+        market_hash_name = description.get("market_hash_name") or description.get(
+            "market_name"
+        )
+        if requested_market_name and market_hash_name != requested_market_name:
+            continue
+
+        asset = dict(description)
+        asset.update(listing.get("asset") or {})
+        asset["market_actions"] = description.get("market_actions") or description.get(
+            "actions"
+        ) or asset.get("market_actions")
+
+        listing_info[listing_id] = {
+            **listing,
+            "converted_price": int(listing.get("unPrice") or 0),
+            "converted_fee": int(listing.get("unFee") or 0),
+            "currencyid": 2000 + int(listing.get("eCurrency") or 0),
+            "asset": asset,
+        }
+    return listing_info
+
+
 def _asset_property(
     asset: dict[str, Any], property_id: int, value_key: str = "string_value"
 ):
     for item_property in asset.get("asset_properties") or []:
         if item_property.get("propertyid") == property_id:
             return item_property.get(value_key)
+    return None
+
+
+def _accessory_property(
+    accessory: dict[str, Any], property_id: int, value_key: str = "string_value"
+):
+    for properties_key in ("parent_relationship_properties", "standalone_properties"):
+        for item_property in accessory.get(properties_key) or []:
+            if item_property.get("propertyid") == property_id:
+                return item_property.get(value_key)
     return None
 
 
@@ -152,13 +270,43 @@ def _extract_titled_images(raw_html: str, prefix: str) -> list[dict[str, str]]:
     return items
 
 
+def _extract_accessories(asset: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    accessories = []
+    for accessory in asset.get("accessory_properties") or []:
+        description = accessory.get("description") or {}
+        market_name = description.get("market_hash_name") or description.get(
+            "market_name"
+        ) or description.get("name")
+        item_type = description.get("type") or ""
+        if kind not in item_type and not str(market_name or "").startswith(f"{kind} |"):
+            continue
+
+        item = {
+            "name": market_name or "",
+            "icon_url": description.get("icon_url") or "",
+            "classid": str(accessory.get("classid") or ""),
+        }
+        wear = _accessory_property(accessory, 4, "float_value")
+        if wear is not None:
+            item["wear"] = wear
+        charm_pattern = _accessory_property(accessory, 3, "int_value")
+        if charm_pattern is not None:
+            item["pattern_template"] = charm_pattern
+        accessories.append(item)
+    return accessories
+
+
 def extract_stickers(asset: dict[str, Any]) -> list[dict[str, str]]:
-    return _extract_titled_images(_description_html(asset, "sticker_info"), "Sticker:")
+    stickers = _extract_titled_images(_description_html(asset, "sticker_info"), "Sticker:")
+    return stickers or _extract_accessories(asset, "Sticker")
 
 
 def extract_charm(asset: dict[str, Any]) -> dict[str, str]:
     charms = _extract_titled_images(_description_html(asset, "keychain_info"), "Charm:")
-    return charms[0] if charms else {}
+    if charms:
+        return charms[0]
+    accessories = _extract_accessories(asset, "Charm")
+    return accessories[0] if accessories else {}
 
 
 def extract_asset_metadata(asset: dict[str, Any]) -> dict[str, Any]:
@@ -358,6 +506,86 @@ class AsyncParser:
             f"Could not fetch Steam market render after {self.max_retries} attempts"
         )
 
+    async def get_json_from_market_search(
+        self,
+        url: str,
+        requested_market_name: str = "",
+        start: int = 0,
+    ) -> dict[str, Any]:
+        search_url = build_market_search_url(url)
+        body = build_market_search_body(
+            search_url,
+            requested_market_name=requested_market_name,
+            start=start,
+        )
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            proxy = (
+                self.proxy_manager.get_random_proxy() if self.proxy_manager else None
+            )
+            try:
+                async with self.steam_session.get_async_session(
+                    search_url
+                ) as local_session:
+                    response = await local_session.post(
+                        search_url,
+                        json=body,
+                        proxy=proxy,
+                        ssl=False,
+                        timeout=self.request_timeout,
+                        headers={
+                            "Accept": "*/*",
+                            "Content-Type": "application/json; charset=utf-8",
+                            "Origin": "https://steamcommunity.com",
+                            "Referer": search_url,
+                            "x-valve-action-type": MARKET_SEARCH_ACTION_TYPE,
+                            "x-valve-request-type": "routeAction",
+                        },
+                    )
+                    text = await response.text()
+                    if response.status == 200:
+                        try:
+                            payload = json.loads(text)
+                        except json.JSONDecodeError as exc:
+                            raise RuntimeError(
+                                f"Steam market search returned non-JSON response: {text[:200]!r}"
+                            ) from exc
+                        if not isinstance(payload.get("listings"), list):
+                            raise RuntimeError(
+                                f"Steam market search returned no listings for {search_url}"
+                            )
+                        return payload
+
+                    logger.warning(
+                        "Steam market search returned HTTP %s for %s on attempt %s/%s",
+                        response.status,
+                        search_url,
+                        attempt,
+                        self.max_retries,
+                    )
+                    if response.status not in self.retry_statuses:
+                        raise RuntimeError(
+                            f"Steam market search returned HTTP {response.status}"
+                        )
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Steam market search request failed for %s on attempt %s/%s: %s",
+                    search_url,
+                    attempt,
+                    self.max_retries,
+                    exc,
+                )
+
+            if attempt < self.max_retries:
+                await asyncio.sleep(self.retry_base_delay * attempt)
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(
+            f"Could not fetch Steam market search after {self.max_retries} attempts"
+        )
+
     async def get_listing_info_from_market(self, url: str) -> dict[str, Any]:
         raw_data, final_url = await self._fetch_raw_data_from_market(url)
         try:
@@ -365,11 +593,36 @@ class AsyncParser:
             return merge_listing_assets(listing_info, _extract_assets_info(raw_data))
         except ListingInfoNotFound:
             logger.warning(
-                "Steam market page did not contain g_rgListingInfo for %s; falling back to render endpoint via %s (%s)",
+                "Steam market page did not contain g_rgListingInfo for %s; falling back via %s (%s)",
                 url,
                 final_url,
                 summarize_market_page(raw_data),
             )
+            requested_market_name = requested_market_name_from_listing_url(url)
+            try:
+                search_payload = await self.get_json_from_market_search(
+                    final_url,
+                    requested_market_name=requested_market_name,
+                )
+                listing_info = normalize_market_search_payload(
+                    search_payload,
+                    requested_market_name=requested_market_name,
+                )
+                if listing_info or not requested_market_name:
+                    return listing_info
+                logger.warning(
+                    "Steam market search returned no listings matching %s via %s",
+                    requested_market_name,
+                    final_url,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Steam market search fallback failed for %s via %s: %s",
+                    url,
+                    final_url,
+                    exc,
+                )
+
             render_payload = await self.get_json_from_market_render(final_url)
             return merge_render_assets(render_payload)
 
