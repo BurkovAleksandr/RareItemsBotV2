@@ -159,8 +159,13 @@ async def get_steam_session(
     mafile: str,
     api_key: str,
     accounts_dir: str,
+    status_recorder=None,
+    step_id: str | None = None,
 ):
     from assets.session import AsyncSteamSession, SteamPyClient
+
+    if status_recorder and step_id:
+        status_recorder.start_step(step_id, detail=f"Loading saved session for {login}")
 
     steam_session = AsyncSteamSession(
         SteamPyClient(),
@@ -174,20 +179,37 @@ async def get_steam_session(
         await asyncio.to_thread(steam_session.load_client, accounts_dir)
         if await asyncio.to_thread(steam_session.is_alive):
             logger.info("Loaded active Steam session for %s", login)
+            if status_recorder and step_id:
+                status_recorder.finish_step(step_id, f"Loaded active session for {login}")
             return steam_session
         logger.info("Saved Steam session for %s is stale", login)
+        if status_recorder and step_id:
+            status_recorder.update_step(step_id, f"Saved session for {login} is stale; logging in")
     except Exception:
         logger.info("No reusable Steam session for %s; logging in", login)
+        if status_recorder and step_id:
+            status_recorder.update_step(step_id, f"No reusable session for {login}; logging in")
 
-    await asyncio.to_thread(steam_session.login)
-    await asyncio.to_thread(steam_session.save_client, accounts_dir)
+    try:
+        await asyncio.to_thread(steam_session.login)
+        await asyncio.to_thread(steam_session.save_client, accounts_dir)
+    except Exception as exc:
+        if status_recorder and step_id:
+            status_recorder.fail_step(step_id, f"{type(exc).__name__}: {exc}")
+        raise
     logger.info("Logged in and saved Steam session for %s", login)
+    if status_recorder and step_id:
+        status_recorder.finish_step(step_id, f"Logged in and saved session for {login}")
     return steam_session
 
 
-def load_proxy_manager(runtime_config: RuntimeConfig):
+def load_proxy_manager(runtime_config: RuntimeConfig, status_recorder=None):
+    if status_recorder:
+        status_recorder.start_step("proxy_setup", detail="Checking proxy configuration")
     if not runtime_config.use_proxies:
         logger.info("Proxy usage disabled by config")
+        if status_recorder:
+            status_recorder.skip_step("proxy_setup", "Proxy usage disabled by config")
         return None
 
     from assets.proxy import ProxyManager
@@ -195,10 +217,12 @@ def load_proxy_manager(runtime_config: RuntimeConfig):
     proxy_manager = ProxyManager(enabled=True)
     proxy_manager.load_proxies(runtime_config.proxies_path)
     logger.info("Loaded %s proxies", len(proxy_manager.proxies))
+    if status_recorder:
+        status_recorder.finish_step("proxy_setup", f"Loaded {len(proxy_manager.proxies)} proxies")
     return proxy_manager
 
 
-async def create_bot(runtime_config: RuntimeConfig):
+async def create_bot(runtime_config: RuntimeConfig, status_recorder=None):
     from assets.bot import AsyncSteamBot
     from assets.buy import BuyModule
     from assets.currency_rates import Currency
@@ -213,6 +237,8 @@ async def create_bot(runtime_config: RuntimeConfig):
         runtime_config.parser_mafile,
         runtime_config.api_key,
         runtime_config.accounts_dir,
+        status_recorder=status_recorder,
+        step_id="parser_session",
     )
 
     buyer_session = await get_steam_session(
@@ -221,13 +247,15 @@ async def create_bot(runtime_config: RuntimeConfig):
         runtime_config.buyer_mafile,
         runtime_config.api_key,
         runtime_config.accounts_dir,
+        status_recorder=status_recorder,
+        step_id="buyer_session",
     )
 
     currency_rates = Currency(runtime_config.api_key)
     if runtime_config.refresh_currency_rates:
         await asyncio.to_thread(currency_rates.update_steam_currency_rates)
 
-    proxy_manager = load_proxy_manager(runtime_config)
+    proxy_manager = load_proxy_manager(runtime_config, status_recorder=status_recorder)
 
     price_repository = PricesRepository(runtime_config.db_path)
     item_price_fetcher = ItemPriceFetcher(
@@ -235,7 +263,21 @@ async def create_bot(runtime_config: RuntimeConfig):
         proxy_manager=proxy_manager,
     )
     if runtime_config.refresh_item_prices:
-        await asyncio.to_thread(item_price_fetcher.update_all_prices, currency_rates)
+        if status_recorder:
+            status_recorder.start_step("sticker_prices", detail="Updating sticker prices from csbackpack")
+        try:
+            updated_count = await asyncio.to_thread(item_price_fetcher.update_all_prices, currency_rates)
+        except Exception as exc:
+            if status_recorder:
+                status_recorder.fail_step("sticker_prices", f"{type(exc).__name__}: {exc}")
+            raise
+        if status_recorder:
+            status_recorder.finish_step("sticker_prices", f"Updated {updated_count} sticker prices")
+    elif status_recorder:
+        status_recorder.skip_step("sticker_prices", "Sticker price refresh disabled")
+
+    if status_recorder:
+        status_recorder.start_step("track_items", detail="Opening track item repository")
 
     bot_config = Config(
         runtime_config.strick3,
@@ -245,7 +287,7 @@ async def create_bot(runtime_config: RuntimeConfig):
         runtime_config.min_stickers_price,
     )
 
-    return AsyncSteamBot(
+    bot = AsyncSteamBot(
         parser_session,
         AsyncParser(parser_session, proxy_manager=proxy_manager),
         ItemInfoFetcher(),
@@ -253,4 +295,8 @@ async def create_bot(runtime_config: RuntimeConfig):
         bot_config,
         BuyModule(buyer_session),
         Items(SqliteItemsRepository(runtime_config.db_path)),
+        status_recorder=status_recorder,
     )
+    if status_recorder:
+        status_recorder.finish_step("track_items", "Track item repository ready")
+    return bot

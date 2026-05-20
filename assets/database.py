@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import json
 from datetime import datetime
 from typing import Iterable
 
@@ -32,6 +33,21 @@ class SqliteItemsRepository:
             )
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS CheckedItems (
+                    listing_id TEXT PRIMARY KEY,
+                    item_name TEXT,
+                    price REAL,
+                    stickers_price REAL,
+                    float_value REAL,
+                    pattern_template TEXT,
+                    profitable INTEGER,
+                    stickers_json TEXT,
+                    checked_at TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS BoughtItems (
                     item_name TEXT,
                     listing_id TEXT,
@@ -41,6 +57,15 @@ class SqliteItemsRepository:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS StickerPrices (
+                    name TEXT PRIMARY KEY,
+                    price REAL
+                )
+                """
+            )
+            self._ensure_column("StickerPrices", "updated_at", "TEXT")
             self._dedupe_track_items()
             cur.execute(
                 """
@@ -49,6 +74,11 @@ class SqliteItemsRepository:
                 """
             )
             self.db.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = [row[1] for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()]
+        if column not in columns:
+            self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _dedupe_track_items(self) -> None:
         self.db.execute(
@@ -122,6 +152,88 @@ class SqliteItemsRepository:
             )
             self.db.commit()
 
+    def add_checked_item_details(
+        self,
+        item_name,
+        listing_id,
+        price,
+        stickers_price,
+        float_value=None,
+        pattern_template=None,
+        stickers=None,
+        profitable=False,
+        checked_at=None,
+    ) -> None:
+        if isinstance(checked_at, datetime):
+            checked_at = checked_at.isoformat(sep=" ", timespec="seconds")
+        checked_at = str(checked_at or datetime.now().isoformat(sep=" ", timespec="seconds"))
+        stickers_json = json.dumps(stickers or [], ensure_ascii=False)
+        with self.lock:
+            self.db.execute(
+                """
+                INSERT OR REPLACE INTO CheckedItems (
+                    listing_id,
+                    item_name,
+                    price,
+                    stickers_price,
+                    float_value,
+                    pattern_template,
+                    profitable,
+                    stickers_json,
+                    checked_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(listing_id),
+                    str(item_name or ""),
+                    price,
+                    stickers_price,
+                    float_value,
+                    None if pattern_template is None else str(pattern_template),
+                    1 if profitable else 0,
+                    stickers_json,
+                    checked_at,
+                ),
+            )
+            self.db.commit()
+
+    def get_recent_checked_items(self, limit: int = 10) -> list[dict[str, object]]:
+        with self.lock:
+            rows = self.db.execute(
+                """
+                SELECT item_name, listing_id, price, stickers_price, float_value,
+                       pattern_template, profitable, stickers_json, checked_at
+                FROM CheckedItems
+                ORDER BY checked_at DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+
+        result = []
+        for row in rows:
+            stickers = []
+            if row[7]:
+                try:
+                    stickers = json.loads(row[7])
+                except json.JSONDecodeError:
+                    stickers = []
+            result.append(
+                {
+                    "item_name": str(row[0] or ""),
+                    "listing_id": str(row[1] or ""),
+                    "price": row[2],
+                    "stickers_price": row[3],
+                    "float_value": row[4],
+                    "pattern_template": row[5],
+                    "profitable": bool(row[6]),
+                    "stickers": stickers,
+                    "checked_at": str(row[8] or ""),
+                }
+            )
+        return result
+
     def check(self, listing_id) -> bool:
         column = self._checked_column()
         with self.lock:
@@ -172,6 +284,30 @@ class SqliteItemsRepository:
         with self.lock:
             return int(self.db.execute("SELECT COUNT(*) FROM BoughtItems").fetchone()[0])
 
+    def count_sticker_prices(self) -> int:
+        with self.lock:
+            return int(self.db.execute("SELECT COUNT(*) FROM StickerPrices").fetchone()[0])
+
+    def get_recent_sticker_prices(self, limit: int = 8) -> list[dict[str, str]]:
+        with self.lock:
+            rows = self.db.execute(
+                """
+                SELECT name, price, updated_at
+                FROM StickerPrices
+                ORDER BY COALESCE(updated_at, '') DESC, name
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [
+            {
+                "name": str(name or ""),
+                "price": "" if price is None else str(price),
+                "updated_at": str(updated_at or ""),
+            }
+            for name, price, updated_at in rows
+        ]
+
 
 class Items:
     def __init__(self, repository: SqliteItemsRepository):
@@ -192,6 +328,12 @@ class Items:
     def add_to_checked(self, listing_id):
         self.repository.add_to_checked(listing_id)
 
+    def add_checked_item_details(self, *args, **kwargs):
+        return self.repository.add_checked_item_details(*args, **kwargs)
+
+    def get_recent_checked_items(self, limit=10):
+        return self.repository.get_recent_checked_items(limit)
+
     def check(self, listing_id) -> bool:
         return self.repository.check(listing_id)
 
@@ -209,3 +351,9 @@ class Items:
 
     def count_bought_items(self):
         return self.repository.count_bought_items()
+
+    def count_sticker_prices(self):
+        return self.repository.count_sticker_prices()
+
+    def get_recent_sticker_prices(self, limit=8):
+        return self.repository.get_recent_sticker_prices(limit)

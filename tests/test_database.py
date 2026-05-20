@@ -46,3 +46,33 @@ def test_recent_bought_items_are_ordered_by_date(tmp_path):
             "date": "2026-05-20 10:00:00",
         }
     ]
+
+
+def test_recent_checked_items_store_debug_details(tmp_path):
+    repository = SqliteItemsRepository(str(tmp_path / "items.db"))
+
+    repository.add_checked_item_details(
+        item_name="AK-47 | Slate",
+        listing_id="listing-1",
+        price=100.0,
+        stickers_price=25.5,
+        float_value=0.123,
+        pattern_template=777,
+        stickers=[{"name": "Sticker | Test", "price": 25.5}],
+        profitable=True,
+        checked_at="2026-05-20 11:00:00",
+    )
+
+    assert repository.get_recent_checked_items(limit=1) == [
+        {
+            "item_name": "AK-47 | Slate",
+            "listing_id": "listing-1",
+            "price": 100.0,
+            "stickers_price": 25.5,
+            "float_value": 0.123,
+            "pattern_template": "777",
+            "profitable": True,
+            "stickers": [{"name": "Sticker | Test", "price": 25.5}],
+            "checked_at": "2026-05-20 11:00:00",
+        }
+    ]

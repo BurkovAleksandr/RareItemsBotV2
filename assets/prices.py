@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+from datetime import datetime
 from typing import Protocol
 
 import requests
@@ -33,17 +34,24 @@ class PricesRepository(IPricesRepository):
                 """
                 CREATE TABLE IF NOT EXISTS StickerPrices (
                     name TEXT PRIMARY KEY,
-                    price REAL
+                    price REAL,
+                    updated_at TEXT
                 )
                 """
             )
+            self._ensure_column("updated_at", "TEXT")
             self.db.commit()
+
+    def _ensure_column(self, column: str, definition: str) -> None:
+        columns = [row[1] for row in self.db.execute("PRAGMA table_info(StickerPrices)").fetchall()]
+        if column not in columns:
+            self.db.execute(f"ALTER TABLE StickerPrices ADD COLUMN {column} {definition}")
 
     def update_price(self, sticker_name: str, price: float) -> None:
         with self.lock:
             self.db.execute(
-                "INSERT OR REPLACE INTO StickerPrices (name, price) VALUES (?, ?)",
-                (sticker_name, price),
+                "INSERT OR REPLACE INTO StickerPrices (name, price, updated_at) VALUES (?, ?, ?)",
+                (sticker_name, price, datetime.now().isoformat(sep=" ", timespec="seconds")),
             )
             self.db.commit()
 

@@ -55,6 +55,9 @@ def test_dashboard_widgets_render_core_values():
         "tracked_count": 2,
         "purchase_count": 1,
         "recent_purchase_count": 1,
+        "recent_checked_count": 1,
+        "sticker_price_count": 5925,
+        "recent_sticker_price_count": 8,
         "proxy_count": 0,
         "proxies_enabled": False,
         "checked_at": "2026-05-20 12:00:00",
@@ -66,3 +69,4 @@ def test_dashboard_widgets_render_core_values():
     assert "RUNNING" in rendered
     assert "47.31 RUB" in rendered
     assert "parser via saved; stale" in rendered
+    assert "Sticker prices" in rendered

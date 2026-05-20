@@ -13,6 +13,7 @@ from assets.inspect import IItemInfoFetcher
 from assets.item import ItemData
 from assets.parser import AsyncParser
 from assets.prices import IItemPriceFetcher
+from assets.runtime_status import RuntimeStatus
 from assets.session import AsyncSteamSession
 from assets.utils import create_message
 
@@ -38,6 +39,7 @@ class AsyncSteamBot:
         config: Config,
         buy_module: BuyModule,
         items: Items,
+        status_recorder: RuntimeStatus | None = None,
     ):
         self.session = session
         self.parser = parser
@@ -46,6 +48,7 @@ class AsyncSteamBot:
         self.config = config
         self.buy_module = buy_module
         self.items_manager = items
+        self.status_recorder = status_recorder
         self._stop_event: asyncio.Event | None = None
         self._running = False
 
@@ -104,14 +107,22 @@ class AsyncSteamBot:
         self._stop_event = stop_event or asyncio.Event()
         self._running = True
         try:
+            if self.status_recorder:
+                self.status_recorder.start_step("bot_loop", "Market loop", "Checking parser session")
             if not await asyncio.to_thread(self.session.is_alive):
+                if self.status_recorder:
+                    self.status_recorder.fail_step("bot_loop", "Parser session is not alive")
                 raise RuntimeError("Steam session is not alive")
 
             logger.info("Bot started with an active Steam session")
+            if self.status_recorder:
+                self.status_recorder.finish_step("bot_loop", "Parser session active; entering market loop")
             counter = 0
             completed_requests = 0
             while not self._stop_requested():
                 items = await asyncio.to_thread(self.items_manager.get_track_items)
+                if self.status_recorder:
+                    self.status_recorder.finish_step("track_items", f"Loaded {len(items)} tracked items")
                 if not items:
                     logger.warning("No tracked items configured; sleeping before the next check")
                     await self._sleep_or_stop(5)
@@ -132,6 +143,8 @@ class AsyncSteamBot:
                 counter += 1
         finally:
             self._running = False
+            if self.status_recorder:
+                self.status_recorder.finish_step("bot_loop", "Bot stopped", status="skipped")
             logger.info("Bot stopped")
 
     async def process_items(self, item_name: str, items: list[dict]) -> None:
@@ -172,7 +185,9 @@ class AsyncSteamBot:
                 continue
 
             logger.info(create_message(item_obj))
-            if not self.calculate_sticker_profitability(item_obj):
+            profitable = self.calculate_sticker_profitability(item_obj)
+            await asyncio.to_thread(self._record_checked_item, item_obj, profitable)
+            if not profitable:
                 continue
 
             if not self.config.autobuy:
@@ -204,6 +219,24 @@ class AsyncSteamBot:
                 )
             except Exception:
                 logger.exception("Failed to buy %s listing %s", item_name, listing_id)
+
+    def _record_checked_item(self, item: ItemData, profitable: bool) -> None:
+        add_details = getattr(self.items_manager, "add_checked_item_details", None)
+        record = {
+            "item_name": item.item_name,
+            "listing_id": item.listing_id,
+            "price": item.item_price,
+            "stickers_price": item.stickers_price,
+            "float_value": item.float_value,
+            "pattern_template": item.pattern_template,
+            "stickers": item.stickers,
+            "profitable": profitable,
+            "checked_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
+        }
+        if add_details:
+            add_details(**record)
+        if self.status_recorder:
+            self.status_recorder.add_checked_item(record)
 
     def calculate_sticker_profitability(self, item: ItemData) -> bool:
         if item.item_price <= 0 or item.stickers_price < self.config.min_stickers_price:

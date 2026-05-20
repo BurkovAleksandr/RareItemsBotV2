@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 from assets.database import SqliteItemsRepository
 from assets.runtime import load_config_data, load_runtime_config, write_config_data
+from assets.runtime_status import RuntimeStatus
 from utils.items_for_track_finder import get_all_exteriors_for_item
 
 
@@ -141,6 +142,7 @@ class AsyncBotController:
         self.last_error: str | None = None
         self.running = False
         self.starting = False
+        self.runtime_status = RuntimeStatus()
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -171,8 +173,15 @@ class AsyncBotController:
     async def _start_bot(self) -> None:
         from assets.runtime import create_bot
 
-        runtime_config = load_runtime_config(self.config_path)
-        bot = await create_bot(runtime_config)
+        self.runtime_status.reset()
+        self.runtime_status.start_step("bot_start", detail="Loading runtime config")
+        try:
+            runtime_config = load_runtime_config(self.config_path)
+            self.runtime_status.finish_step("bot_start", "Runtime config loaded")
+            bot = await create_bot(runtime_config, status_recorder=self.runtime_status)
+        except Exception as exc:
+            self.runtime_status.fail_step("bot_start", f"{type(exc).__name__}: {exc}")
+            raise
         self.bot = bot
         task = self.loop.create_task(bot.start())
         task.add_done_callback(self._bot_done)
@@ -372,6 +381,8 @@ class BotWebHandler(BaseHTTPRequestHandler):
         repository = SqliteItemsRepository(db_path)
         tracked_items = repository.get_track_items()
         recent_purchases = repository.get_recent_bought_items(limit=8)
+        recent_checked_items = repository.get_recent_checked_items(limit=10)
+        recent_sticker_prices = repository.get_recent_sticker_prices(limit=8)
         items_text = serialize_track_items(tracked_items)
         proxies_text = read_text_file(proxies_path)
         status = self.controller.status()
@@ -380,6 +391,8 @@ class BotWebHandler(BaseHTTPRequestHandler):
             status=status,
             tracked_items=tracked_items,
             recent_purchases=recent_purchases,
+            recent_checked_items=recent_checked_items,
+            recent_sticker_prices=recent_sticker_prices,
             proxies_text=proxies_text,
             repository=repository,
         )
@@ -390,6 +403,8 @@ class BotWebHandler(BaseHTTPRequestHandler):
             dashboard=dashboard,
             tracked_items=tracked_items,
             recent_purchases=recent_purchases,
+            recent_checked_items=recent_checked_items,
+            recent_sticker_prices=recent_sticker_prices,
             items_text=items_text,
             proxies_text=proxies_text,
             db_path=db_path,
@@ -397,7 +412,7 @@ class BotWebHandler(BaseHTTPRequestHandler):
         )
         self.send_html(html_body)
 
-    def build_html(
+    def _legacy_build_html(
         self,
         config: dict,
         message: str,
@@ -641,6 +656,8 @@ class BotWebHandler(BaseHTTPRequestHandler):
         status: dict[str, Any],
         tracked_items: list[dict[str, str]],
         recent_purchases: list[dict[str, str]],
+        recent_checked_items: list[dict[str, Any]],
+        recent_sticker_prices: list[dict[str, str]],
         proxies_text: str,
         repository: SqliteItemsRepository,
     ) -> dict[str, Any]:
@@ -659,9 +676,13 @@ class BotWebHandler(BaseHTTPRequestHandler):
             "tracked_count": len(tracked_items),
             "purchase_count": repository.count_bought_items(),
             "recent_purchase_count": len(recent_purchases),
+            "recent_checked_count": len(recent_checked_items),
+            "sticker_price_count": repository.count_sticker_prices(),
+            "recent_sticker_price_count": len(recent_sticker_prices),
             "proxy_count": proxy_count,
             "proxies_enabled": parse_bool(config.get("USE_PROXIES")),
             "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "runtime": self.controller.runtime_status.snapshot(),
         }
 
     def inspect_steam_session(
@@ -723,6 +744,8 @@ class BotWebHandler(BaseHTTPRequestHandler):
         dashboard: dict[str, Any],
         tracked_items: list[dict[str, str]],
         recent_purchases: list[dict[str, str]],
+        recent_checked_items: list[dict[str, Any]],
+        recent_sticker_prices: list[dict[str, str]],
         items_text: str,
         proxies_text: str,
         db_path: str,
@@ -802,6 +825,37 @@ class BotWebHandler(BaseHTTPRequestHandler):
     .metric.ok {{ border-left-color: var(--ok); }}
     .metric.warn {{ border-left-color: var(--warn); }}
     .metric.danger {{ border-left-color: var(--danger); }}
+    .timeline {{ display: grid; grid-template-columns: repeat(7, minmax(120px, 1fr)); gap: 10px; }}
+    .checkpoint {{
+      position: relative;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fff;
+      min-height: 94px;
+    }}
+    .checkpoint summary {{ cursor: pointer; list-style: none; }}
+    .checkpoint summary::-webkit-details-marker {{ display: none; }}
+    .dot {{ width: 12px; height: 12px; border-radius: 50%; background: #94a3b8; display: inline-block; margin-right: 7px; }}
+    .checkpoint.active .dot {{ background: var(--accent-2); }}
+    .checkpoint.success .dot {{ background: var(--ok); }}
+    .checkpoint.error .dot {{ background: var(--danger); }}
+    .checkpoint.skipped .dot {{ background: var(--warn); }}
+    .checkpoint-title {{ font-weight: 700; }}
+    .checkpoint-detail {{ color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.4; overflow-wrap: anywhere; }}
+    .checkpoint-events {{ margin-top: 10px; color: var(--muted); font-size: 12px; line-height: 1.45; }}
+    .checked-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
+    .checked-card {{
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fff;
+    }}
+    .checked-card.profitable {{ border-left: 4px solid var(--ok); }}
+    .checked-card .name {{ font-weight: 700; margin-bottom: 6px; overflow-wrap: anywhere; }}
+    .kv {{ color: var(--muted); font-size: 12px; line-height: 1.55; }}
+    .stickers {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }}
+    .sticker-pill {{ border: 1px solid var(--border); border-radius: 999px; padding: 4px 7px; font-size: 12px; background: #f8fafc; }}
     .split {{ display: grid; grid-template-columns: minmax(360px, 0.95fr) minmax(560px, 1.45fr); gap: 16px; }}
     .tables {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }}
     label {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 5px; }}
@@ -876,12 +930,13 @@ class BotWebHandler(BaseHTTPRequestHandler):
     }}
     @media (max-width: 1120px) {{
       .dashboard {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .timeline {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .split, .tables {{ grid-template-columns: 1fr; }}
     }}
     @media (max-width: 680px) {{
       main {{ padding: 12px; }}
       header {{ padding: 14px 16px; }}
-      .dashboard, .grid {{ grid-template-columns: 1fr; }}
+      .dashboard, .grid, .timeline, .checked-grid {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -907,16 +962,36 @@ class BotWebHandler(BaseHTTPRequestHandler):
       <div class="dashboard">{self.render_metrics(dashboard)}</div>
     </section>
 
+    <section>
+      <h2>Startup checkpoints</h2>
+      {self.render_timeline(dashboard["runtime"]["steps"])}
+    </section>
+
+    <section>
+      <div class="toolbar">
+        <div>
+          <h2>Latest checked listings</h2>
+          <div class="meta">Recent processed listings with sticker values.</div>
+        </div>
+      </div>
+      {self.render_checked_items(recent_checked_items or dashboard["runtime"].get("recent_checked", []))}
+    </section>
+
     <div class="tables">
       <section>
         <h2>Recent purchases</h2>
         {self.render_recent_purchases(recent_purchases)}
       </section>
       <section>
-        <h2>Tracked items</h2>
-        {self.render_tracked_items_table(tracked_items)}
+        <h2>Sticker prices</h2>
+        {self.render_sticker_prices(recent_sticker_prices)}
       </section>
     </div>
+
+    <section>
+      <h2>Tracked items</h2>
+      {self.render_tracked_items_table(tracked_items)}
+    </section>
 
     <div class="split">
       <div>
@@ -1010,6 +1085,18 @@ class BotWebHandler(BaseHTTPRequestHandler):
                 f"latest visible: {dashboard['recent_purchase_count']}",
                 "ok" if dashboard["purchase_count"] else "idle",
             ),
+            (
+                "Sticker prices",
+                str(dashboard["sticker_price_count"]),
+                f"recent rows visible: {dashboard['recent_sticker_price_count']}",
+                "ok" if dashboard["sticker_price_count"] else "warn",
+            ),
+            (
+                "Checked listings",
+                str(dashboard["recent_checked_count"]),
+                "latest processed listings in debug panel",
+                "ok" if dashboard["recent_checked_count"] else "idle",
+            ),
         ]
         return "\n".join(self.render_metric_card(*card) for card in cards)
 
@@ -1021,6 +1108,93 @@ class BotWebHandler(BaseHTTPRequestHandler):
             f'<div class="detail">{html.escape(detail)}</div>'
             "</article>"
         )
+
+    def render_timeline(self, steps: list[dict[str, Any]]) -> str:
+        if not steps:
+            return '<div class="empty">No checkpoint data yet.</div>'
+        rendered_steps = []
+        for step in steps:
+            status = str(step.get("status") or "pending")
+            label = str(step.get("label") or step.get("id") or "")
+            detail = str(step.get("detail") or "")
+            events = step.get("events") or []
+            events_html = "".join(
+                f"<div>{html.escape(str(event.get('at', '')))} · "
+                f"{html.escape(str(event.get('status', '')))} · "
+                f"{html.escape(str(event.get('message', '')))}</div>"
+                for event in events
+            )
+            rendered_steps.append(
+                f'<details class="checkpoint {html.escape(status)}">'
+                "<summary>"
+                '<span class="dot"></span>'
+                f'<span class="checkpoint-title">{html.escape(label)}</span>'
+                "</summary>"
+                f'<div class="checkpoint-detail">{html.escape(detail or status)}</div>'
+                f'<div class="checkpoint-events">{events_html}</div>'
+                "</details>"
+            )
+        return f'<div class="timeline">{"".join(rendered_steps)}</div>'
+
+    def render_checked_items(self, checked_items: list[dict[str, Any]]) -> str:
+        if not checked_items:
+            return '<div class="empty">No checked listings yet.</div>'
+        cards = []
+        for item in checked_items[:10]:
+            stickers = item.get("stickers") or []
+            sticker_html = "".join(
+                '<span class="sticker-pill">'
+                f"{html.escape(str(sticker.get('name', '')))}"
+                f" · {html.escape(str(sticker.get('price', 0)))}"
+                "</span>"
+                for sticker in stickers[:6]
+                if isinstance(sticker, dict)
+            )
+            if not sticker_html:
+                sticker_html = '<span class="sticker-pill">no stickers</span>'
+            profitable_class = " profitable" if item.get("profitable") else ""
+            cards.append(
+                f'<article class="checked-card{profitable_class}">'
+                f'<div class="name">{html.escape(str(item.get("item_name") or ""))}</div>'
+                '<div class="kv">'
+                f'Listing: {html.escape(str(item.get("listing_id") or ""))}<br>'
+                f'Price: {html.escape(self.format_number(item.get("price")))} RUB<br>'
+                f'Stickers: {html.escape(self.format_number(item.get("stickers_price")))} RUB<br>'
+                f'Float: {html.escape(self.format_number(item.get("float_value")))}<br>'
+                f'Pattern: {html.escape(str(item.get("pattern_template") or "-"))}<br>'
+                f'Checked: {html.escape(str(item.get("checked_at") or ""))}'
+                "</div>"
+                f'<div class="stickers">{sticker_html}</div>'
+                "</article>"
+            )
+        return f'<div class="checked-grid">{"".join(cards)}</div>'
+
+    def render_sticker_prices(self, sticker_prices: list[dict[str, str]]) -> str:
+        if not sticker_prices:
+            return '<div class="empty">No sticker price rows yet.</div>'
+        rows = []
+        for row in sticker_prices:
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(row['name'])}</td>"
+                f"<td>{html.escape(row['price'])}</td>"
+                f"<td>{html.escape(row['updated_at'] or '-')}</td>"
+                "</tr>"
+            )
+        return (
+            "<table>"
+            "<thead><tr><th>Sticker</th><th>Price</th><th>Updated</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
+        )
+
+    def format_number(self, value: Any) -> str:
+        if value in (None, ""):
+            return "-"
+        try:
+            return f"{float(value):.2f}".rstrip("0").rstrip(".")
+        except (TypeError, ValueError):
+            return str(value)
 
     def session_label(self, summary: dict[str, Any]) -> str:
         if summary.get("active") is True:
