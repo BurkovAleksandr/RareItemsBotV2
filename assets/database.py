@@ -87,6 +87,10 @@ class SqliteItemsRepository:
             ).fetchall()
             return [{item[0]: item[1]} for item in items]
 
+    def count_track_items(self) -> int:
+        with self.lock:
+            return int(self.db.execute("SELECT COUNT(*) FROM TrackItems").fetchone()[0])
+
     def replace_track_items(self, items: Iterable[tuple[str, str]]) -> int:
         item_rows = self._normalize_track_items(items)
         with self.lock:
@@ -141,6 +145,33 @@ class SqliteItemsRepository:
             )
             self.db.commit()
 
+    def get_recent_bought_items(self, limit: int = 10) -> list[dict[str, str]]:
+        with self.lock:
+            rows = self.db.execute(
+                """
+                SELECT item_name, listing_id, price, stickers_price, date
+                FROM BoughtItems
+                ORDER BY date DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+
+        return [
+            {
+                "item_name": str(item_name or ""),
+                "listing_id": str(listing_id or ""),
+                "price": "" if price is None else str(price),
+                "stickers_price": "" if stickers_price is None else str(stickers_price),
+                "date": str(date or ""),
+            }
+            for item_name, listing_id, price, stickers_price, date in rows
+        ]
+
+    def count_bought_items(self) -> int:
+        with self.lock:
+            return int(self.db.execute("SELECT COUNT(*) FROM BoughtItems").fetchone()[0])
+
 
 class Items:
     def __init__(self, repository: SqliteItemsRepository):
@@ -148,6 +179,9 @@ class Items:
 
     def get_track_items(self):
         return self.repository.get_track_items()
+
+    def count_track_items(self):
+        return self.repository.count_track_items()
 
     def replace_track_items(self, items):
         return self.repository.replace_track_items(items)
@@ -169,3 +203,9 @@ class Items:
             stickers_price,
             date,
         )
+
+    def get_recent_bought_items(self, limit=10):
+        return self.repository.get_recent_bought_items(limit)
+
+    def count_bought_items(self):
+        return self.repository.count_bought_items()

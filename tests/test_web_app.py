@@ -44,3 +44,25 @@ def test_secret_config_field_does_not_render_value():
 
     assert "super-secret" not in rendered
     assert 'placeholder="unchanged"' in rendered
+
+
+def test_dashboard_widgets_render_core_values():
+    dashboard = {
+        "bot_state": "RUNNING",
+        "bot_state_class": "ok",
+        "buyer_session": {"login": "buyer", "active": True, "wallet_balance": "47.31", "source": "saved"},
+        "parser_session": {"login": "parser", "active": False, "error": "stale", "source": "saved"},
+        "tracked_count": 2,
+        "purchase_count": 1,
+        "recent_purchase_count": 1,
+        "proxy_count": 0,
+        "proxies_enabled": False,
+        "checked_at": "2026-05-20 12:00:00",
+    }
+
+    handler = object.__new__(BotWebHandler)
+    rendered = handler.render_metrics(dashboard)
+
+    assert "RUNNING" in rendered
+    assert "47.31 RUB" in rendered
+    assert "parser via saved; stale" in rendered

@@ -370,13 +370,26 @@ class BotWebHandler(BaseHTTPRequestHandler):
         proxies_path = str(config.get("PROXIES_PATH") or "./proxies.txt")
 
         repository = SqliteItemsRepository(db_path)
-        items_text = serialize_track_items(repository.get_track_items())
+        tracked_items = repository.get_track_items()
+        recent_purchases = repository.get_recent_bought_items(limit=8)
+        items_text = serialize_track_items(tracked_items)
         proxies_text = read_text_file(proxies_path)
         status = self.controller.status()
+        dashboard = self.collect_dashboard(
+            config=config,
+            status=status,
+            tracked_items=tracked_items,
+            recent_purchases=recent_purchases,
+            proxies_text=proxies_text,
+            repository=repository,
+        )
         html_body = self.build_html(
             config=config,
             message=message,
             status=status,
+            dashboard=dashboard,
+            tracked_items=tracked_items,
+            recent_purchases=recent_purchases,
             items_text=items_text,
             proxies_text=proxies_text,
             db_path=db_path,
@@ -620,6 +633,457 @@ class BotWebHandler(BaseHTTPRequestHandler):
             f"<input id=\"{escaped_name}\" name=\"{escaped_name}\" type=\"{field_type}\""
             f"{step}{placeholder} value=\"{html.escape(input_value, quote=True)}\">"
             "</div>"
+        )
+
+    def collect_dashboard(
+        self,
+        config: dict,
+        status: dict[str, Any],
+        tracked_items: list[dict[str, str]],
+        recent_purchases: list[dict[str, str]],
+        proxies_text: str,
+        repository: SqliteItemsRepository,
+    ) -> dict[str, Any]:
+        proxy_count = len(
+            [line for line in proxies_text.splitlines() if line.strip() and not line.strip().startswith("#")]
+        )
+        bot = getattr(self.controller, "bot", None)
+        buyer_session = getattr(getattr(bot, "buy_module", None), "steam_session", None)
+        parser_session = getattr(bot, "session", None)
+
+        return {
+            "bot_state": "STARTING" if status["starting"] else "RUNNING" if status["running"] else "STOPPED",
+            "bot_state_class": "starting" if status["starting"] else "ok" if status["running"] else "idle",
+            "buyer_session": self.inspect_steam_session(config, "BUYER", buyer_session, include_wallet=True),
+            "parser_session": self.inspect_steam_session(config, "PARSER", parser_session, include_wallet=False),
+            "tracked_count": len(tracked_items),
+            "purchase_count": repository.count_bought_items(),
+            "recent_purchase_count": len(recent_purchases),
+            "proxy_count": proxy_count,
+            "proxies_enabled": parse_bool(config.get("USE_PROXIES")),
+            "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def inspect_steam_session(
+        self,
+        config: dict,
+        role: str,
+        session: Any = None,
+        include_wallet: bool = False,
+    ) -> dict[str, Any]:
+        login = str(config.get(f"{role}_LOGIN") or "").strip()
+        summary: dict[str, Any] = {
+            "login": login or "-",
+            "active": None,
+            "wallet_balance": None,
+            "error": None,
+            "source": "runtime" if session else "saved",
+        }
+        if not login:
+            summary["error"] = "not configured"
+            return summary
+
+        if session is None:
+            try:
+                from assets.session import AsyncSteamSession, SteamPyClient
+
+                session = AsyncSteamSession(
+                    SteamPyClient(),
+                    login,
+                    "",
+                    str(config.get(f"{role}_MAFILE") or ""),
+                    api_key=str(config.get("API_KEY") or ""),
+                )
+                session.load_client(str(config.get("ACCOUNTS_DIR") or "./accounts/"))
+            except Exception as exc:
+                summary["active"] = False
+                summary["error"] = f"{type(exc).__name__}: {exc}"
+                return summary
+
+        try:
+            summary["active"] = bool(session.is_alive())
+        except Exception as exc:
+            summary["active"] = False
+            summary["error"] = f"{type(exc).__name__}: {exc}"
+            return summary
+
+        if include_wallet and summary["active"]:
+            try:
+                summary["wallet_balance"] = str(session.get_client().get_wallet_balance(convert_to_decimal=True))
+            except Exception as exc:
+                summary["error"] = f"wallet: {type(exc).__name__}: {exc}"
+
+        return summary
+
+    def build_html(
+        self,
+        config: dict,
+        message: str,
+        status: dict[str, Any],
+        dashboard: dict[str, Any],
+        tracked_items: list[dict[str, str]],
+        recent_purchases: list[dict[str, str]],
+        items_text: str,
+        proxies_text: str,
+        db_path: str,
+        proxies_path: str,
+    ) -> str:
+        status_label = "STARTING" if status["starting"] else "RUNNING" if status["running"] else "STOPPED"
+        status_class = "starting" if status["starting"] else "ok" if status["running"] else "idle"
+        config_fields = "\n".join(self.render_config_field(config, field) for field in CONFIG_FIELDS)
+        log_tail = html.escape(self.read_log_tail())
+        message_html = f'<div class="notice">{html.escape(message)}</div>' if message else ""
+        started_at = html.escape(status["started_at"] or "-")
+        last_error = html.escape(status["last_error"] or "-")
+        checked_at = html.escape(str(dashboard["checked_at"]))
+
+        return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RareItemsBot Dashboard</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --border: #d9e0ea;
+      --text: #172033;
+      --muted: #627084;
+      --accent: #0f766e;
+      --accent-2: #2457a6;
+      --ok: #16803c;
+      --warn: #a16207;
+      --danger: #b42318;
+      --shadow: 0 1px 2px rgba(20, 32, 48, 0.08);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Segoe UI, Arial, sans-serif;
+      font-size: 14px;
+    }}
+    header {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 24px;
+      background: #18212f;
+      color: #fff;
+    }}
+    h1 {{ margin: 0; font-size: 20px; font-weight: 650; letter-spacing: 0; }}
+    h2 {{ margin: 0 0 12px; font-size: 16px; letter-spacing: 0; }}
+    main {{ display: block; max-width: 1480px; margin: 0 auto; padding: 16px; }}
+    section {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 16px;
+      margin-bottom: 16px;
+    }}
+    .toolbar {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }}
+    .dashboard {{ display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); gap: 12px; }}
+    .metric {{
+      border: 1px solid var(--border);
+      border-left: 4px solid #94a3b8;
+      border-radius: 8px;
+      background: #fff;
+      padding: 14px;
+      min-height: 116px;
+    }}
+    .metric .label {{ color: var(--muted); font-size: 12px; margin-bottom: 8px; }}
+    .metric .value {{ font-size: 24px; font-weight: 750; line-height: 1.15; overflow-wrap: anywhere; }}
+    .metric .detail {{ margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }}
+    .metric.ok {{ border-left-color: var(--ok); }}
+    .metric.warn {{ border-left-color: var(--warn); }}
+    .metric.danger {{ border-left-color: var(--danger); }}
+    .split {{ display: grid; grid-template-columns: minmax(360px, 0.95fr) minmax(560px, 1.45fr); gap: 16px; }}
+    .tables {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }}
+    label {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 5px; }}
+    input[type="text"], input[type="password"], input[type="number"], textarea, select {{
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: var(--text);
+      background: #fff;
+      font: inherit;
+    }}
+    textarea {{ min-height: 220px; resize: vertical; font-family: Consolas, monospace; font-size: 13px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
+    .field {{ min-width: 0; }}
+    .checkrow {{ display: flex; align-items: center; gap: 8px; min-height: 34px; }}
+    .checkrow label {{ margin: 0; color: var(--text); font-size: 13px; }}
+    .actions {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
+    .toolbar .actions {{ margin-top: 0; }}
+    button {{
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 8px 12px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+    }}
+    button.check {{ background: var(--accent-2); }}
+    button.secondary {{ background: #fff; color: var(--text); border-color: var(--border); }}
+    button.danger {{ background: var(--danger); }}
+    .status {{
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-weight: 700;
+      background: #eef2f7;
+      color: #344054;
+    }}
+    .status.ok {{ background: #dcfce7; color: #166534; }}
+    .status.starting {{ background: #fef3c7; color: #92400e; }}
+    .status.idle {{ background: #eef2f7; color: #344054; }}
+    .notice {{
+      margin: 16px auto 0;
+      max-width: 1480px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid #b6d7c9;
+      background: #ecfdf3;
+      color: #14532d;
+    }}
+    .meta {{ color: var(--muted); line-height: 1.7; }}
+    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
+    th, td {{ border-bottom: 1px solid var(--border); padding: 8px 6px; text-align: left; vertical-align: top; }}
+    th {{ color: var(--muted); font-size: 12px; font-weight: 650; }}
+    td {{ overflow-wrap: anywhere; }}
+    a {{ color: var(--accent-2); }}
+    .empty {{ color: var(--muted); padding: 18px 0; }}
+    .log {{
+      min-height: 180px;
+      max-height: 280px;
+      overflow: auto;
+      white-space: pre-wrap;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      background: #111827;
+      color: #d1d5db;
+      border-radius: 6px;
+      padding: 10px;
+    }}
+    @media (max-width: 1120px) {{
+      .dashboard {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .split, .tables {{ grid-template-columns: 1fr; }}
+    }}
+    @media (max-width: 680px) {{
+      main {{ padding: 12px; }}
+      header {{ padding: 14px 16px; }}
+      .dashboard, .grid {{ grid-template-columns: 1fr; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>RareItemsBot</h1>
+    <span class="status {status_class}">{status_label}</span>
+  </header>
+  {message_html}
+  <main>
+    <section>
+      <div class="toolbar">
+        <div>
+          <h2>Dashboard</h2>
+          <div class="meta">Checked: {checked_at}</div>
+        </div>
+        <div class="actions">
+          <form method="get" action="/"><button type="submit" class="check">Check now</button></form>
+          <form method="post" action="/control/start"><button type="submit">Start</button></form>
+          <form method="post" action="/control/stop"><button type="submit" class="danger">Stop</button></form>
+        </div>
+      </div>
+      <div class="dashboard">{self.render_metrics(dashboard)}</div>
+    </section>
+
+    <div class="tables">
+      <section>
+        <h2>Recent purchases</h2>
+        {self.render_recent_purchases(recent_purchases)}
+      </section>
+      <section>
+        <h2>Tracked items</h2>
+        {self.render_tracked_items_table(tracked_items)}
+      </section>
+    </div>
+
+    <div class="split">
+      <div>
+        <section>
+          <h2>Control</h2>
+          <div class="meta">
+            Started: {started_at}<br>
+            Last error: {last_error}<br>
+            DB: {html.escape(db_path)}<br>
+            Proxies: {html.escape(proxies_path)}
+          </div>
+          <div class="actions">
+            <form method="post" action="/control/start"><button type="submit">Start</button></form>
+            <form method="post" action="/control/stop"><button type="submit" class="danger">Stop</button></form>
+            <form method="get" action="/"><button type="submit" class="secondary">Refresh</button></form>
+          </div>
+        </section>
+        <section>
+          <h2>Log</h2>
+          <div class="log">{log_tail}</div>
+        </section>
+      </div>
+      <div>
+        <section>
+          <h2>Config</h2>
+          <form method="post" action="/config">
+            <div class="grid">{config_fields}</div>
+            <div class="actions"><button type="submit">Save config</button></div>
+          </form>
+        </section>
+        <section>
+          <h2>Items</h2>
+          <form method="post" action="/items" enctype="multipart/form-data">
+            <textarea name="items_text">{html.escape(items_text)}</textarea>
+            <div class="grid" style="margin-top: 12px;">
+              <div class="field">
+                <label>File</label>
+                <input type="file" name="items_file" accept=".txt,.csv">
+              </div>
+              <div class="field">
+                <label>Mode</label>
+                <select name="items_mode">
+                  <option value="replace">Replace</option>
+                  <option value="append">Append</option>
+                </select>
+              </div>
+              <div class="checkrow">
+                <input id="expand_exteriors" type="checkbox" name="expand_exteriors" value="1">
+                <label for="expand_exteriors">Expand CS2 exteriors</label>
+              </div>
+            </div>
+            <div class="actions"><button type="submit">Save items</button></div>
+          </form>
+        </section>
+        <section>
+          <h2>Proxies</h2>
+          <form method="post" action="/proxies" enctype="multipart/form-data">
+            <textarea name="proxies_text">{html.escape(proxies_text)}</textarea>
+            <div class="field" style="margin-top: 12px;">
+              <label>File</label>
+              <input type="file" name="proxies_file" accept=".txt">
+            </div>
+            <div class="actions"><button type="submit">Save proxies</button></div>
+          </form>
+        </section>
+      </div>
+    </div>
+  </main>
+</body>
+</html>"""
+
+    def render_metrics(self, dashboard: dict[str, Any]) -> str:
+        buyer = dashboard["buyer_session"]
+        parser = dashboard["parser_session"]
+        wallet = buyer.get("wallet_balance")
+        proxy_detail = "enabled" if dashboard["proxies_enabled"] else "disabled"
+        cards = [
+            ("Bot", dashboard["bot_state"], f"started state: {dashboard['bot_state'].lower()}", dashboard["bot_state_class"]),
+            ("Buyer session", self.session_label(buyer), self.session_detail(buyer), self.session_class(buyer)),
+            ("Parser session", self.session_label(parser), self.session_detail(parser), self.session_class(parser)),
+            ("Buyer balance", f"{wallet} RUB" if wallet else "-", "wallet check from buyer session", "ok" if wallet else "idle"),
+            (
+                "Tracked",
+                str(dashboard["tracked_count"]),
+                f"items in SQLite; proxies {proxy_detail}: {dashboard['proxy_count']}",
+                "ok" if dashboard["tracked_count"] else "warn",
+            ),
+            (
+                "Purchases",
+                str(dashboard["purchase_count"]),
+                f"latest visible: {dashboard['recent_purchase_count']}",
+                "ok" if dashboard["purchase_count"] else "idle",
+            ),
+        ]
+        return "\n".join(self.render_metric_card(*card) for card in cards)
+
+    def render_metric_card(self, label: str, value: str, detail: str, state: str) -> str:
+        return (
+            f'<article class="metric {html.escape(state)}">'
+            f'<div class="label">{html.escape(label)}</div>'
+            f'<div class="value">{html.escape(value)}</div>'
+            f'<div class="detail">{html.escape(detail)}</div>'
+            "</article>"
+        )
+
+    def session_label(self, summary: dict[str, Any]) -> str:
+        if summary.get("active") is True:
+            return "ACTIVE"
+        if summary.get("active") is False:
+            return "INACTIVE"
+        return "UNKNOWN"
+
+    def session_class(self, summary: dict[str, Any]) -> str:
+        if summary.get("active") is True:
+            return "ok"
+        if summary.get("active") is False:
+            return "danger"
+        return "idle"
+
+    def session_detail(self, summary: dict[str, Any]) -> str:
+        detail = f"{summary.get('login') or '-'} via {summary.get('source') or 'saved'}"
+        if summary.get("error"):
+            detail += f"; {summary['error']}"
+        return detail
+
+    def render_recent_purchases(self, recent_purchases: list[dict[str, str]]) -> str:
+        if not recent_purchases:
+            return '<div class="empty">No purchases yet.</div>'
+        rows = []
+        for purchase in recent_purchases:
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(purchase['date'])}</td>"
+                f"<td>{html.escape(purchase['item_name'])}</td>"
+                f"<td>{html.escape(purchase['price'])}</td>"
+                f"<td>{html.escape(purchase['stickers_price'])}</td>"
+                "</tr>"
+            )
+        return (
+            "<table>"
+            "<thead><tr><th>Date</th><th>Item</th><th>Price</th><th>Stickers</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
+        )
+
+    def render_tracked_items_table(self, tracked_items: list[dict[str, str]]) -> str:
+        if not tracked_items:
+            return '<div class="empty">No tracked items.</div>'
+        rows = []
+        for item in tracked_items[:12]:
+            name, url = next(iter(item.items()))
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(name)}</td>"
+                f'<td><a href="{html.escape(url, quote=True)}" target="_blank" rel="noreferrer">'
+                f"{html.escape(url)}</a></td>"
+                "</tr>"
+            )
+        suffix = ""
+        if len(tracked_items) > 12:
+            suffix = f'<div class="meta" style="margin-top:10px;">Showing 12 of {len(tracked_items)}.</div>'
+        return (
+            "<table>"
+            "<thead><tr><th>Item</th><th>Steam page</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
+            f"{suffix}"
         )
 
     def read_log_tail(self) -> str:
