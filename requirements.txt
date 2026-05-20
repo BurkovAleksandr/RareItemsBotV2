@@ -3,6 +3,7 @@ beautifulsoup4==4.12.3
 bs4==0.0.2
 certifi==2024.12.14
 charset-normalizer==3.4.1
+fastapi==0.136.1
 colorlog==6.10.1
 idna==3.10
 propcache==0.4.1
@@ -12,3 +13,4 @@ rsa==4.9
 soupsieve==2.6
 steampy==1.2.0
 urllib3==2.3.0
+uvicorn==0.47.0

@@ -27,6 +27,12 @@ accounts/
 settings.py
 NebulaAuth
 config/
+frontend/node_modules/
+frontend/dist/
+!frontend/
+!frontend/index.html
+!frontend/src/
+!frontend/src/**
 
 # Local scratch/dev files kept outside version control.
 Dockerfile
