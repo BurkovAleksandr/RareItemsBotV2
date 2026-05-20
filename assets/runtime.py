@@ -264,7 +264,10 @@ async def create_bot(runtime_config: RuntimeConfig, status_recorder=None):
     )
     if runtime_config.refresh_item_prices:
         if status_recorder:
-            status_recorder.start_step("sticker_prices", detail="Updating sticker prices from csbackpack")
+            status_recorder.start_step(
+                "sticker_prices",
+                detail=f"Updating sticker prices via {', '.join(item_price_fetcher.provider_names)}",
+            )
         try:
             updated_count = await asyncio.to_thread(item_price_fetcher.update_all_prices, currency_rates)
         except Exception as exc:
