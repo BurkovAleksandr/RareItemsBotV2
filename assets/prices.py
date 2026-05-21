@@ -6,16 +6,16 @@ import logging
 import re
 import sqlite3
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import Any, Protocol
 
 import requests
 from bs4 import BeautifulSoup
 
 from assets.currency_rates import Currency
 from assets.proxy import ProxyManager
-
 
 logger = logging.getLogger(__name__)
 
@@ -36,28 +36,35 @@ class PricesRepository(IPricesRepository):
         self.lock = threading.RLock()
         self.db = sqlite3.connect(db_path, check_same_thread=False)
         with self.lock:
-            self.db.execute(
-                """
+            self.db.execute("""
                 CREATE TABLE IF NOT EXISTS StickerPrices (
                     name TEXT PRIMARY KEY,
                     price REAL,
                     updated_at TEXT
                 )
-                """
-            )
+                """)
             self._ensure_column("updated_at", "TEXT")
             self.db.commit()
 
     def _ensure_column(self, column: str, definition: str) -> None:
-        columns = [row[1] for row in self.db.execute("PRAGMA table_info(StickerPrices)").fetchall()]
+        columns = [
+            row[1]
+            for row in self.db.execute("PRAGMA table_info(StickerPrices)").fetchall()
+        ]
         if column not in columns:
-            self.db.execute(f"ALTER TABLE StickerPrices ADD COLUMN {column} {definition}")
+            self.db.execute(
+                f"ALTER TABLE StickerPrices ADD COLUMN {column} {definition}"
+            )
 
     def update_price(self, sticker_name: str, price: float) -> None:
         with self.lock:
             self.db.execute(
                 "INSERT OR REPLACE INTO StickerPrices (name, price, updated_at) VALUES (?, ?, ?)",
-                (sticker_name, price, datetime.now().isoformat(sep=" ", timespec="seconds")),
+                (
+                    sticker_name,
+                    price,
+                    datetime.now().isoformat(sep=" ", timespec="seconds"),
+                ),
             )
             self.db.commit()
 
@@ -100,7 +107,7 @@ class IPriceProvider(Protocol):
     def fetch_prices(self) -> list[PriceEntry]:
         pass
 
-    def iter_price_pages(self) -> list[PriceEntry]:
+    def iter_price_pages(self) -> Iterable[list[PriceEntry]]:
         pass
 
 
@@ -118,9 +125,13 @@ class BaseHttpPriceProvider:
         self.session = session or requests.Session()
 
     def _request_get(self, url: str, **kwargs) -> requests.Response:
-        proxy_str = self.proxy_manager.get_random_proxy() if self.proxy_manager else None
+        proxy_str = (
+            self.proxy_manager.get_random_proxy() if self.proxy_manager else None
+        )
         proxies = {"http": proxy_str, "https": proxy_str} if proxy_str else None
-        response = self.session.get(url, proxies=proxies, timeout=self.request_timeout, **kwargs)
+        response = self.session.get(
+            url, proxies=proxies, timeout=self.request_timeout, **kwargs
+        )
         response.raise_for_status()
         return response
 
@@ -166,7 +177,12 @@ class SteamAnalystPriceProvider(BaseHttpPriceProvider):
             page_entries = self.parse_html(response.text)
             if not page_entries:
                 break
-            logger.info("Parsed %s sticker prices from %s page %s", len(page_entries), self.name, page)
+            logger.info(
+                "Parsed %s sticker prices from %s page %s",
+                len(page_entries),
+                self.name,
+                page,
+            )
             yield page_entries
 
             if total_pages is None:
@@ -191,8 +207,19 @@ class SteamAnalystPriceProvider(BaseHttpPriceProvider):
             if "sticker" not in href.lower():
                 continue
 
-            parts = [part.strip() for part in link.get_text("\n").splitlines() if part.strip()]
-            price_index = next((index for index, part in enumerate(parts) if _is_usd_price_label(part)), None)
+            parts = [
+                part.strip()
+                for part in link.get_text("\n").splitlines()
+                if part.strip()
+            ]
+            price_index = next(
+                (
+                    index
+                    for index, part in enumerate(parts)
+                    if _is_usd_price_label(part)
+                ),
+                None,
+            )
             if price_index is None:
                 continue
 
@@ -220,70 +247,215 @@ class SteamAnalystPriceProvider(BaseHttpPriceProvider):
         return entries
 
     def extract_total_pages(self, raw_html: str) -> int | None:
-        numbers = [int(value) for value in re.findall(r"(?:page=|Page\s+)(\d{1,5})", raw_html, flags=re.I)]
+        numbers = [
+            int(value)
+            for value in re.findall(r"(?:page=|Page\s+)(\d{1,5})", raw_html, flags=re.I)
+        ]
         return max(numbers) if numbers else None
 
 
-class CsBackpackPriceProvider(BaseHttpPriceProvider):
-    name = "csbackpack"
+class SkinPockPriceProvider(BaseHttpPriceProvider):
+    name = "skinpock"
+
+    def __init__(
+        self,
+        base_url: str = "https://www.skinpock.com/api/items",
+        page_size: int = 300,
+        max_pages: int | None = 1000,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.base_url = base_url
+        self.page_size = page_size
+        self.max_pages = max_pages
 
     def fetch_prices(self) -> list[PriceEntry]:
-        url = (
-            "https://www.csbackpack.net/api/items?"
-            "page=1&max=300000&price_real_min=0&price_real_max=100000&item_group=sticker"
-        )
-        response = self._request_get(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                )
-            },
-        )
-        data = response.json()
-        if not isinstance(data, list):
-            raise ValueError("Unexpected csbackpack response format")
-
         entries: list[PriceEntry] = []
-        for sticker in data:
-            sticker_name = sticker.get("markethashname")
-            if not sticker_name:
+        for page_entries in self.iter_price_pages():
+            entries.extend(page_entries)
+        return entries
+
+    def iter_price_pages(self):
+        page = 1
+        while self.max_pages is None or page <= self.max_pages:
+            response = self._request_get(
+                self.base_url,
+                params={
+                    "page": page,
+                    "max": self.page_size,
+                    "price_real_min": 0,
+                    "price_real_max": 100000,
+                    "item_group": "sticker",
+                },
+                headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                },
+            )
+            page_entries, total_pages, has_more = self.parse_payload(response.json())
+            if not page_entries:
+                logger.info("SkinPock page %s returned no sticker prices", page)
+                break
+
+            logger.info(
+                "Parsed %s sticker prices from %s page %s",
+                len(page_entries),
+                self.name,
+                page,
+            )
+            yield page_entries
+
+            if total_pages is not None and page >= total_pages:
+                break
+            if has_more is False:
+                break
+            if (
+                total_pages is None
+                and has_more is None
+                and len(page_entries) < self.page_size
+            ):
+                break
+            page += 1
+
+    def parse_payload(
+        self, payload: Any
+    ) -> tuple[list[PriceEntry], int | None, bool | None]:
+        items, total_pages, has_more = self._extract_items(payload)
+        entries: list[PriceEntry] = []
+        for sticker in items:
+            if not isinstance(sticker, dict):
                 continue
 
-            sold30d = sticker.get("sold30d", 0)
-            if not sold30d or sold30d <= 10:
+            sticker_name = _first_value(
+                sticker,
+                (
+                    "markethashname",
+                    "market_hash_name",
+                    "marketHashName",
+                    "market_name",
+                    "marketName",
+                    "name",
+                    "item_name",
+                ),
+            )
+            if sticker_name is None:
                 continue
 
-            sticker_price = sticker.get("pricelatest") or sticker.get("priceavg7d")
+            volume = _parse_int(
+                _first_value(
+                    sticker,
+                    (
+                        "sold30d",
+                        "sold_30d",
+                        "volume",
+                        "sales",
+                        "sold",
+                    ),
+                )
+            )
+            if volume is not None and volume <= 10:
+                continue
+
+            sticker_price = _parse_number(
+                _first_value(
+                    sticker,
+                    (
+                        "pricelatest",
+                        "price_latest",
+                        "priceavg7d",
+                        "price_avg_7d",
+                        "price_real",
+                        "price",
+                        "steam_price",
+                        "latest_price",
+                        "market_price",
+                        "price_usd",
+                    ),
+                )
+            )
             if sticker_price is None:
                 continue
             entries.append(
                 PriceEntry(
                     name=str(sticker_name),
-                    price_usd=float(sticker_price),
+                    price_usd=sticker_price,
                     source=self.name,
-                    volume=int(sold30d),
+                    volume=volume,
                 )
             )
-        return entries
+        return entries, total_pages, has_more
+
+    def _extract_items(self, payload: Any) -> tuple[list[Any], int | None, bool | None]:
+        if isinstance(payload, list):
+            return payload, None, None
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected skinpock response format")
+
+        items = None
+        for key in ("items", "data", "results", "list"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+
+        if items is None:
+            raise ValueError("Unexpected skinpock response format")
+
+        total_pages = _parse_int(
+            _first_value(
+                payload,
+                (
+                    "total_pages",
+                    "totalPages",
+                    "pages",
+                    "last_page",
+                    "lastPage",
+                ),
+            )
+        )
+        has_more = _parse_bool(
+            _first_value(
+                payload,
+                (
+                    "has_more",
+                    "hasMore",
+                    "has_next",
+                    "hasNext",
+                    "next",
+                ),
+            )
+        )
+        return items, total_pages, has_more
 
 
 def normalize_steamanalyst_name(parts: list[str]) -> str:
-    clean_parts = [re.sub(r"\s+", " ", part).strip(" -") for part in parts if part and part.strip()]
+    clean_parts = [
+        re.sub(r"\s+", " ", part).strip(" -") for part in parts if part and part.strip()
+    ]
     clean_parts = [part for part in clean_parts if part and not part.startswith("$")]
     if not clean_parts:
         return ""
 
     if any(part.startswith(("Sticker |", "Sticker Slab |")) for part in clean_parts):
-        return next(part for part in clean_parts if part.startswith(("Sticker |", "Sticker Slab |")))
+        return next(
+            part
+            for part in clean_parts
+            if part.startswith(("Sticker |", "Sticker Slab |"))
+        )
 
     if clean_parts[0].startswith("Sticker "):
         return clean_parts[0]
 
     if len(clean_parts) >= 2:
         return f"Sticker | {clean_parts[0]} | {clean_parts[1]}"
-    return clean_parts[0] if clean_parts[0].startswith("Sticker") else f"Sticker | {clean_parts[0]}"
+    return (
+        clean_parts[0]
+        if clean_parts[0].startswith("Sticker")
+        else f"Sticker | {clean_parts[0]}"
+    )
 
 
 def _parse_usd_price(value: str) -> float | None:
@@ -291,6 +463,45 @@ def _parse_usd_price(value: str) -> float | None:
     if not match:
         return None
     return float(match.group(1).replace(",", ""))
+
+
+def _first_value(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _parse_number(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"-?[0-9][0-9,]*(?:\.[0-9]+)?", str(value))
+    if not match:
+        return None
+    return float(match.group(0).replace(",", ""))
+
+
+def _parse_int(value: Any) -> int | None:
+    parsed = _parse_number(value)
+    return int(parsed) if parsed is not None else None
+
+
+def _parse_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no", ""}:
+        return False
+    return True
 
 
 def _is_usd_price_label(value: str) -> bool:
@@ -324,8 +535,12 @@ class ItemPriceFetcher(IItemPriceFetcher):
         self.request_timeout = request_timeout
         self.recent_price_max_age_hours = float(recent_price_max_age_hours)
         self.providers = providers or [
-            SteamAnalystPriceProvider(proxy_manager=proxy_manager, request_timeout=request_timeout),
-            CsBackpackPriceProvider(proxy_manager=proxy_manager, request_timeout=request_timeout),
+            SkinPockPriceProvider(
+                proxy_manager=proxy_manager, request_timeout=request_timeout
+            ),
+            SteamAnalystPriceProvider(
+                proxy_manager=proxy_manager, request_timeout=request_timeout
+            ),
         ]
 
     @property
@@ -383,11 +598,15 @@ class ItemPriceFetcher(IItemPriceFetcher):
         else:
             yield provider.fetch_prices()
 
-    def _update_entries(self, currency: Currency, entries: list[PriceEntry]) -> tuple[int, int]:
+    def _update_entries(
+        self, currency: Currency, entries: list[PriceEntry]
+    ) -> tuple[int, int]:
         updated_count = 0
         skipped_recent_count = 0
         for entry in entries:
-            if self.repository.is_price_recent(entry.name, self.recent_price_max_age_hours):
+            if self.repository.is_price_recent(
+                entry.name, self.recent_price_max_age_hours
+            ):
                 skipped_recent_count += 1
                 continue
 

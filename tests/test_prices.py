@@ -4,6 +4,7 @@ from assets.prices import (
     ItemPriceFetcher,
     PriceEntry,
     PricesRepository,
+    SkinPockPriceProvider,
     SteamAnalystPriceProvider,
 )
 
@@ -43,6 +44,107 @@ def test_steamanalyst_provider_parses_card_html():
         PriceEntry("Sticker | 00 Nation (Glitter) | Rio 2022", 1.03, "steamanalyst"),
         PriceEntry("Sticker | apEX | Cluj-Napoca 2015", 3.45, "steamanalyst"),
     ]
+
+
+def test_skinpock_provider_parses_list_payload():
+    payload = [
+        {
+            "markethashname": "Sticker | Liquid Fire",
+            "pricelatest": "1.25",
+            "sold30d": 12,
+        },
+        {
+            "markethashname": "Sticker | Low Volume",
+            "pricelatest": 2.0,
+            "sold30d": 2,
+        },
+    ]
+
+    entries, total_pages, has_more = SkinPockPriceProvider(max_pages=1).parse_payload(
+        payload
+    )
+
+    assert entries == [PriceEntry("Sticker | Liquid Fire", 1.25, "skinpock", 12)]
+    assert total_pages is None
+    assert has_more is None
+
+
+def test_skinpock_provider_parses_dict_payload_with_pagination():
+    payload = {
+        "data": [
+            {
+                "market_hash_name": "Sticker | Flexible Schema",
+                "price_real": "$3.50",
+                "volume": "25",
+            }
+        ],
+        "totalPages": 4,
+        "hasMore": True,
+    }
+
+    entries, total_pages, has_more = SkinPockPriceProvider(max_pages=1).parse_payload(
+        payload
+    )
+
+    assert entries == [PriceEntry("Sticker | Flexible Schema", 3.5, "skinpock", 25)]
+    assert total_pages == 4
+    assert has_more is True
+
+
+class FakeSkinPockResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self.payload
+
+
+class FakeSkinPockSession:
+    def __init__(self):
+        self.requests = []
+
+    def get(self, url, **kwargs):
+        self.requests.append((url, kwargs))
+        page = kwargs["params"]["page"]
+        payloads = {
+            1: {
+                "data": [
+                    {
+                        "market_hash_name": "Sticker | Page One",
+                        "price_real": 1.0,
+                        "volume": 15,
+                    }
+                ],
+                "totalPages": 2,
+            },
+            2: {
+                "data": [
+                    {
+                        "market_hash_name": "Sticker | Page Two",
+                        "price_real": 2.0,
+                        "volume": 20,
+                    }
+                ],
+                "totalPages": 2,
+            },
+        }
+        return FakeSkinPockResponse(payloads[page])
+
+
+def test_skinpock_provider_streams_pages():
+    session = FakeSkinPockSession()
+    provider = SkinPockPriceProvider(session=session, page_size=1, max_pages=5)
+
+    pages = list(provider.iter_price_pages())
+
+    assert pages == [
+        [PriceEntry("Sticker | Page One", 1.0, "skinpock", 15)],
+        [PriceEntry("Sticker | Page Two", 2.0, "skinpock", 20)],
+    ]
+    assert [request[1]["params"]["page"] for request in session.requests] == [1, 2]
 
 
 class FailingProvider:
