@@ -306,6 +306,7 @@ async def create_bot(runtime_config: RuntimeConfig, status_recorder=None):
         BuyModule(buyer_session),
         Items(SqliteItemsRepository(runtime_config.db_path)),
         status_recorder=status_recorder,
+        accounts_dir=runtime_config.accounts_dir,
     )
     if status_recorder:
         status_recorder.finish_step("track_items", "Track item repository ready")

@@ -40,6 +40,7 @@ class AsyncSteamBot:
         buy_module: BuyModule,
         items: Items,
         status_recorder: RuntimeStatus | None = None,
+        accounts_dir: str = "./accounts/",
     ):
         self.session = session
         self.parser = parser
@@ -49,6 +50,7 @@ class AsyncSteamBot:
         self.buy_module = buy_module
         self.items_manager = items
         self.status_recorder = status_recorder
+        self.accounts_dir = accounts_dir
         self._stop_event: asyncio.Event | None = None
         self._running = False
 
@@ -100,6 +102,46 @@ class AsyncSteamBot:
                 tasks.append(self.create_one_task(item_name, item_url, delay=delay))
         return tasks
 
+    async def _ensure_steam_session_alive(
+        self,
+        session: AsyncSteamSession | None,
+        role: str,
+        status_step: str | None = None,
+    ) -> None:
+        if session is None:
+            return
+
+        try:
+            if await asyncio.to_thread(session.is_alive):
+                return
+        except Exception as exc:
+            logger.warning("%s Steam session health check failed: %s", role, exc)
+
+        logger.warning("%s Steam session is inactive; logging in again", role)
+        if self.status_recorder and status_step:
+            self.status_recorder.update_step(
+                status_step,
+                f"{role} Steam session inactive; logging in again",
+            )
+
+        try:
+            await asyncio.to_thread(session.login)
+            await asyncio.to_thread(session.save_client, self.accounts_dir)
+            if not await asyncio.to_thread(session.is_alive):
+                raise RuntimeError(f"{role} Steam session is still inactive after login")
+        except Exception as exc:
+            if self.status_recorder and status_step:
+                self.status_recorder.fail_step(status_step, f"{role} relogin failed: {type(exc).__name__}: {exc}")
+            raise
+
+        logger.info("%s Steam session was refreshed and saved", role)
+        if self.status_recorder and status_step:
+            self.status_recorder.update_step(
+                status_step,
+                f"{role} Steam session refreshed",
+                status="success",
+            )
+
     async def start(self, stop_event: asyncio.Event | None = None) -> None:
         if self._running:
             raise RuntimeError("Bot is already running")
@@ -109,10 +151,7 @@ class AsyncSteamBot:
         try:
             if self.status_recorder:
                 self.status_recorder.start_step("bot_loop", "Market loop", "Checking parser session")
-            if not await asyncio.to_thread(self.session.is_alive):
-                if self.status_recorder:
-                    self.status_recorder.fail_step("bot_loop", "Parser session is not alive")
-                raise RuntimeError("Steam session is not alive")
+            await self._ensure_steam_session_alive(self.session, "Parser", "bot_loop")
 
             logger.info("Bot started with an active Steam session")
             if self.status_recorder:
@@ -120,6 +159,7 @@ class AsyncSteamBot:
             counter = 0
             completed_requests = 0
             while not self._stop_requested():
+                await self._ensure_steam_session_alive(self.session, "Parser", "bot_loop")
                 items = await asyncio.to_thread(self.items_manager.get_track_items)
                 if self.status_recorder:
                     self.status_recorder.finish_step("track_items", f"Loaded {len(items)} tracked items")
@@ -195,6 +235,11 @@ class AsyncSteamBot:
                 continue
 
             try:
+                await self._ensure_steam_session_alive(
+                    getattr(self.buy_module, "steam_session", None),
+                    "Buyer",
+                    "buyer_session",
+                )
                 purchase_result = await asyncio.to_thread(
                     self.buy_module.buy_item,
                     item_name,
@@ -209,6 +254,8 @@ class AsyncSteamBot:
                     item_price,
                     item_obj.stickers_price,
                     datetime.now(),
+                    success=True,
+                    error="",
                 )
                 logger.info(
                     "Bought %s listing %s for %.2f; wallet balance after buy: %s",
@@ -217,7 +264,18 @@ class AsyncSteamBot:
                     item_price,
                     purchase_result.wallet_balance,
                 )
-            except Exception:
+            except Exception as exc:
+                error_message = f"{type(exc).__name__}: {exc}"
+                await asyncio.to_thread(
+                    self.items_manager.add_to_bought_items,
+                    item_name,
+                    listing_id,
+                    item_price,
+                    item_obj.stickers_price,
+                    datetime.now(),
+                    success=False,
+                    error=error_message,
+                )
                 logger.exception("Failed to buy %s listing %s", item_name, listing_id)
 
     def _record_checked_item(self, item: ItemData, profitable: bool) -> None:

@@ -9,7 +9,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -243,6 +243,31 @@ def create_app(config_path: str | None = None) -> FastAPI:
     @app.get("/api/dashboard")
     def dashboard() -> dict[str, Any]:
         return build_dashboard(state)
+
+    @app.get("/api/checked-items")
+    def checked_items(
+        date_from: str | None = None,
+        date_to: str | None = None,
+        min_stickers_price: float | None = None,
+        max_stickers_price: float | None = None,
+        min_item_price: float | None = None,
+        max_item_price: float | None = None,
+        has_streak: bool | None = None,
+        limit: int | None = Query(None, ge=1, le=50000),
+    ) -> dict[str, Any]:
+        config = load_config_data(state.config_path)
+        repository = SqliteItemsRepository(str(config.get("DB_PATH") or "./db.db"))
+        items = repository.get_checked_items(
+            date_from=date_from,
+            date_to=date_to,
+            min_stickers_price=min_stickers_price,
+            max_stickers_price=max_stickers_price,
+            min_item_price=min_item_price,
+            max_item_price=max_item_price,
+            has_streak=has_streak,
+            limit=limit,
+        )
+        return {"items": items, "count": len(items)}
 
     @app.post("/api/bot/start")
     def start_bot() -> dict[str, str]:
