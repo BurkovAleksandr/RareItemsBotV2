@@ -6,10 +6,11 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Generator, Protocol
 
 import requests
 from bs4 import BeautifulSoup
@@ -40,10 +41,17 @@ class PricesRepository(IPricesRepository):
                 CREATE TABLE IF NOT EXISTS StickerPrices (
                     name TEXT PRIMARY KEY,
                     price REAL,
-                    updated_at TEXT
+                    updated_at TEXT,
+                    normalized_name TEXT UNIQUE
                 )
                 """)
             self._ensure_column("updated_at", "TEXT")
+            self._ensure_column("normalized_name", "TEXT")
+            self._backfill_normalized_names()
+            self.db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sticker_prices_normalized_name
+                ON StickerPrices(normalized_name)
+                """)
             self.db.commit()
 
     def _ensure_column(self, column: str, definition: str) -> None:
@@ -56,23 +64,78 @@ class PricesRepository(IPricesRepository):
                 f"ALTER TABLE StickerPrices ADD COLUMN {column} {definition}"
             )
 
+    def _backfill_normalized_names(self) -> None:
+        rows = self.db.execute("""
+            SELECT name
+            FROM StickerPrices
+            WHERE normalized_name IS NULL OR normalized_name = ''
+            """).fetchall()
+        if not rows:
+            return
+        self.db.executemany(
+            "UPDATE StickerPrices SET normalized_name = ? WHERE name = ?",
+            [
+                (normalize_price_lookup_key(str(row[0] or "")), str(row[0] or ""))
+                for row in rows
+            ],
+        )
+
     def update_price(self, sticker_name: str, price: float) -> None:
+        sticker_name = str(sticker_name or "").strip()
+        if not sticker_name:
+            return
+
         with self.lock:
             self.db.execute(
-                "INSERT OR REPLACE INTO StickerPrices (name, price, updated_at) VALUES (?, ?, ?)",
+                """
+                INSERT OR REPLACE INTO StickerPrices (
+                    name,
+                    price,
+                    updated_at,
+                    normalized_name
+                )
+                VALUES (?, ?, ?, ?)
+                """,
                 (
                     sticker_name,
                     price,
                     datetime.now().isoformat(sep=" ", timespec="seconds"),
+                    normalize_price_lookup_key(sticker_name),
                 ),
             )
             self.db.commit()
 
     def get_price_by_name(self, item_name: str) -> float:
+        item_name = str(item_name or "").strip()
+        if not item_name:
+            return 0
+
+        suffix_pattern = f"%{_escape_sql_like(item_name)}"
+        normalized_name = normalize_price_lookup_key(item_name)
         with self.lock:
             price = self.db.execute(
-                "SELECT price FROM StickerPrices WHERE name LIKE ?",
-                (f"%{item_name}",),
+                """
+                SELECT price
+                FROM StickerPrices
+                WHERE name = ?
+                   OR normalized_name = ?
+                   OR name LIKE ? ESCAPE '\\'
+                ORDER BY
+                    CASE
+                        WHEN name = ? THEN 0
+                        WHEN normalized_name = ? THEN 1
+                        ELSE 2
+                    END,
+                    LENGTH(name)
+                LIMIT 1
+                """,
+                (
+                    item_name,
+                    normalized_name,
+                    suffix_pattern,
+                    item_name,
+                    normalized_name,
+                ),
             ).fetchone()
             return float(price[0]) if price else 0
 
@@ -99,6 +162,7 @@ class PriceEntry:
     price_usd: float
     source: str
     volume: int | None = None
+    currency_id: int = 1001
 
 
 class IPriceProvider(Protocol):
@@ -135,8 +199,189 @@ class BaseHttpPriceProvider:
         response.raise_for_status()
         return response
 
+    def _request_post(self, url: str, **kwargs) -> requests.Response:
+        proxy_str = (
+            self.proxy_manager.get_random_proxy() if self.proxy_manager else None
+        )
+        proxies = {"http": proxy_str, "https": proxy_str} if proxy_str else None
+        response = self.session.post(
+            url, proxies=proxies, timeout=self.request_timeout, **kwargs
+        )
+        response.raise_for_status()
+        return response
+
     def iter_price_pages(self):
         yield self.fetch_prices()
+
+
+class SteamMarketSearchPriceProvider(BaseHttpPriceProvider):
+    name = "steam"
+
+    def __init__(
+        self,
+        base_url: str = "https://steamcommunity.com/market/search",
+        app_id: int = 730,
+        currency_id: int = 5,
+        page_size: int = 30,
+        max_pages: int | None = None,
+        max_429_retries: int = 3,
+        retry_delay_seconds: float = 1,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.base_url = base_url
+        self.app_id = app_id
+        self.currency_id = currency_id
+        self.page_size = page_size
+        self.max_pages = max_pages
+        self.max_429_retries = max_429_retries
+        self.retry_delay_seconds = retry_delay_seconds
+
+    def fetch_prices(self) -> list[PriceEntry]:
+        entries: list[PriceEntry] = []
+        for page_entries in self.iter_price_pages():
+            entries.extend(page_entries)
+        return entries
+
+    def iter_price_pages(self) -> Generator[list[PriceEntry], Any, None]:
+        start = 0
+        page = 0
+        total_count = None
+        while self.max_pages is None or page < self.max_pages:
+            response = self._request_search_page(start)
+            page_entries, total_count, result_count = self.parse_payload(
+                response.json()
+            )
+            if result_count <= 0:
+                break
+
+            if page_entries:
+                logger.info(
+                    "Parsed %s sticker prices from %s start %s",
+                    len(page_entries),
+                    self.name,
+                    start,
+                )
+                yield page_entries
+
+            page += 1
+            start += result_count
+            if total_count is not None and start >= total_count:
+                break
+
+    def _request_search_page(self, start: int) -> requests.Response:
+        retries = 0
+        while True:
+            try:
+                return self._request_post(
+                    self.base_url,
+                    params={
+                        "appid": self.app_id,
+                        "category_730_Type[]": "tag_CSGO_Tool_Sticker",
+                    },
+                    json=[
+                        {
+                            "appid": self.app_id,
+                            "filters": {
+                                "category_730_Type": ["tag_CSGO_Tool_Sticker"]
+                            },
+                            "price": {"eCurrency": self.currency_id},
+                            "accessoryFilters": {},
+                            "start": start,
+                        }
+                    ],
+                    headers={
+                        "Accept": "*/*",
+                        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                        "Content-Type": "application/json;charset=UTF-8",
+                        "Origin": "https://steamcommunity.com",
+                        "Referer": (
+                            "https://steamcommunity.com/market/search"
+                            f"?appid={self.app_id}&category_730_Type%5B%5D=tag_CSGO_Tool_Sticker"
+                        ),
+                        "x-valve-action-type": "ZFJAHYDA:SearchMarketListings",
+                        "x-valve-request-type": "routeAction",
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) "
+                            "Gecko/20100101 Firefox/150.0"
+                        ),
+                    },
+                )
+            except requests.HTTPError as exc:
+                if not _is_rate_limited(exc) or retries >= self.max_429_retries:
+                    raise
+                retries += 1
+                delay = _retry_after_seconds(exc) or self.retry_delay_seconds
+                logger.warning(
+                    "Steam market search returned 429 for start %s; retry %s/%s",
+                    start,
+                    retries,
+                    self.max_429_retries,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+
+    def parse_payload(
+        self, payload: Any
+    ) -> tuple[list[PriceEntry], int | None, int]:
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected Steam market search response format")
+
+        results = payload.get("results") or []
+        if not isinstance(results, list):
+            raise ValueError("Unexpected Steam market search response format")
+
+        total_count = _parse_int(payload.get("total_count"))
+        result_count = len(results)
+        entries: list[PriceEntry] = []
+        seen: set[str] = set()
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+
+            name = self._extract_result_name(item)
+            if not is_sticker_price_name(name) or name in seen:
+                continue
+
+            price = self._extract_result_price(item)
+            if price is None:
+                continue
+
+            entries.append(
+                PriceEntry(
+                    name=name,
+                    price_usd=price,
+                    source=self.name,
+                    volume=_parse_int(item.get("cSellOrders")),
+                    currency_id=2000 + int(item.get("eCurrency") or self.currency_id),
+                )
+            )
+            seen.add(name)
+        return entries, total_count, result_count
+
+    def _extract_result_name(self, item: dict[str, Any]) -> str:
+        asset = item.get("asset_description") or {}
+        if isinstance(asset, dict):
+            name = _first_value(
+                asset,
+                (
+                    "market_hash_name",
+                    "market_name",
+                    "name",
+                    "market_bucket_group_name",
+                ),
+            )
+            if name:
+                return str(name).strip()
+        return str(item.get("strHash") or "").strip()
+
+    def _extract_result_price(self, item: dict[str, Any]) -> float | None:
+        subtotal = _parse_money_label(item.get("strMinSellSubtotal"))
+        if subtotal is None:
+            return None
+        steam_fee = _parse_int(item.get("unSteamFee")) or 0
+        publisher_fee = _parse_int(item.get("unPublisherFee")) or 0
+        return round(subtotal + ((steam_fee + publisher_fee) / 100), 2)
 
 
 class SteamAnalystPriceProvider(BaseHttpPriceProvider):
@@ -206,6 +451,8 @@ class SteamAnalystPriceProvider(BaseHttpPriceProvider):
             href = str(link.get("href") or "")
             if "sticker" not in href.lower():
                 continue
+            if _contains_slab_word(href):
+                continue
 
             parts = [
                 part.strip()
@@ -223,9 +470,12 @@ class SteamAnalystPriceProvider(BaseHttpPriceProvider):
             if price_index is None:
                 continue
 
-            name = normalize_steamanalyst_name(parts[:price_index])
+            alt_name = _extract_image_alt_name(link)
+            name = normalize_steamanalyst_name(
+                [alt_name] if alt_name else parts[:price_index]
+            )
             price = _parse_usd_price(parts[price_index])
-            if not name or price is None or name in seen:
+            if not is_sticker_price_name(name) or price is None or name in seen:
                 continue
             entries.append(PriceEntry(name=name, price_usd=price, source=self.name))
             seen.add(name)
@@ -240,7 +490,7 @@ class SteamAnalystPriceProvider(BaseHttpPriceProvider):
         for match in pattern.finditer(text):
             name = normalize_steamanalyst_name([match.group("name")])
             price = _parse_usd_price(match.group("price"))
-            if not name or price is None or name in seen:
+            if not is_sticker_price_name(name) or price is None or name in seen:
                 continue
             entries.append(PriceEntry(name=name, price_usd=price, source=self.name))
             seen.add(name)
@@ -260,8 +510,8 @@ class SkinPockPriceProvider(BaseHttpPriceProvider):
     def __init__(
         self,
         base_url: str = "https://www.skinpock.com/api/items",
-        page_size: int = 300,
-        max_pages: int | None = 1000,
+        page_size: int = 1000,
+        max_pages: int | None = 15,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -275,7 +525,7 @@ class SkinPockPriceProvider(BaseHttpPriceProvider):
             entries.extend(page_entries)
         return entries
 
-    def iter_price_pages(self):
+    def iter_price_pages(self) -> Generator[list[PriceEntry], Any, None]:
         page = 1
         while self.max_pages is None or page <= self.max_pages:
             response = self._request_get(
@@ -312,12 +562,6 @@ class SkinPockPriceProvider(BaseHttpPriceProvider):
                 break
             if has_more is False:
                 break
-            if (
-                total_pages is None
-                and has_more is None
-                and len(page_entries) < self.page_size
-            ):
-                break
             page += 1
 
     def parse_payload(
@@ -342,6 +586,9 @@ class SkinPockPriceProvider(BaseHttpPriceProvider):
                 ),
             )
             if sticker_name is None:
+                continue
+            sticker_name = str(sticker_name)
+            if not is_sticker_price_name(sticker_name):
                 continue
 
             volume = _parse_int(
@@ -380,7 +627,7 @@ class SkinPockPriceProvider(BaseHttpPriceProvider):
                 continue
             entries.append(
                 PriceEntry(
-                    name=str(sticker_name),
+                    name=sticker_name,
                     price_usd=sticker_price,
                     source=self.name,
                     volume=volume,
@@ -458,11 +705,48 @@ def normalize_steamanalyst_name(parts: list[str]) -> str:
     )
 
 
+def is_sticker_price_name(item_name: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(item_name or "")).strip()
+    if not normalized.startswith("Sticker |"):
+        return False
+    return not _contains_slab_word(normalized)
+
+
+def normalize_price_lookup_key(item_name: str) -> str:
+    return "".join(ch for ch in str(item_name or "").casefold() if ch.isalnum())
+
+
+def _contains_slab_word(value: str) -> bool:
+    return bool(re.search(r"\bslab\b", str(value or ""), flags=re.I))
+
+
+def _extract_image_alt_name(link) -> str:
+    image = link.find("img", alt=True)
+    if image is None:
+        return ""
+    return re.sub(r"\s+", " ", str(image.get("alt") or "")).strip()
+
+
 def _parse_usd_price(value: str) -> float | None:
     match = re.search(r"\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", str(value))
     if not match:
         return None
     return float(match.group(1).replace(",", ""))
+
+
+def _parse_money_label(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    text = str(value).replace("\xa0", " ")
+    match = re.search(r"([0-9][0-9\s.,]*)", text)
+    if not match:
+        return None
+    number = match.group(1).replace(" ", "")
+    if "," in number and "." in number:
+        number = number.replace(",", "")
+    elif "," in number:
+        number = number.replace(",", ".")
+    return float(number)
 
 
 def _first_value(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
@@ -471,6 +755,10 @@ def _first_value(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
         if value not in (None, ""):
             return value
     return None
+
+
+def _escape_sql_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _parse_number(value: Any) -> float | None:
@@ -504,6 +792,19 @@ def _parse_bool(value: Any) -> bool | None:
     return True
 
 
+def _is_rate_limited(exc: requests.HTTPError) -> bool:
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 429
+
+
+def _retry_after_seconds(exc: requests.HTTPError) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("Retry-After")
+    parsed = _parse_number(retry_after)
+    return parsed if parsed is not None and parsed >= 0 else None
+
+
 def _is_usd_price_label(value: str) -> bool:
     return bool(re.match(r"^\s*\$\s*[0-9][0-9,]*(?:\.[0-9]+)?\s*$", str(value)))
 
@@ -535,6 +836,9 @@ class ItemPriceFetcher(IItemPriceFetcher):
         self.request_timeout = request_timeout
         self.recent_price_max_age_hours = float(recent_price_max_age_hours)
         self.providers = providers or [
+            SteamMarketSearchPriceProvider(
+                proxy_manager=proxy_manager, request_timeout=request_timeout
+            ),
             SkinPockPriceProvider(
                 proxy_manager=proxy_manager, request_timeout=request_timeout
             ),
@@ -604,13 +908,19 @@ class ItemPriceFetcher(IItemPriceFetcher):
         updated_count = 0
         skipped_recent_count = 0
         for entry in entries:
+            if not is_sticker_price_name(entry.name):
+                continue
+
             if self.repository.is_price_recent(
                 entry.name, self.recent_price_max_age_hours
             ):
                 skipped_recent_count += 1
                 continue
 
-            converted_price = currency.change_currency(entry.price_usd, 1001)
+            converted_price = currency.change_currency(
+                entry.price_usd,
+                entry.currency_id,
+            )
             self.repository.update_price(entry.name, round(converted_price, 2))
             updated_count += 1
         return updated_count, skipped_recent_count
