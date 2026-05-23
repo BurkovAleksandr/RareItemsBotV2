@@ -28,7 +28,8 @@ from steampy.models import Asset, GameOptions, SteamUrl
 
 
 _PATCHED = False
-MOBILE_APP_CODE_TYPE = "DeviceCode"
+MOBILE_APP_CODE_TYPE = 3
+MOBILE_APP_CODE_TYPE_NAME = "DeviceCode"
 STEAM_WEB_OAUTH_CLIENT_ID = "DE45CD61"
 STEAM_COOKIE_DOMAINS = (
     "steamcommunity.com",
@@ -123,6 +124,34 @@ def _cookie_presence(session: requests.Session) -> dict[str, list[str]]:
     return {name: sorted(set(domains)) for name, domains in presence.items()}
 
 
+def _allowed_confirmations_summary(response_info: dict[str, Any]) -> list[dict[str, Any]]:
+    confirmations = response_info.get("allowed_confirmations") or []
+    if not isinstance(confirmations, list):
+        return []
+
+    summary = []
+    for confirmation in confirmations:
+        if not isinstance(confirmation, dict):
+            summary.append({"raw": str(confirmation)})
+            continue
+        confirmation_type = (
+            confirmation.get("confirmation_type")
+            or confirmation.get("confirmationType")
+            or confirmation.get("type")
+        )
+        summary.append(
+            {
+                "type": confirmation_type,
+                "message_present": bool(
+                    confirmation.get("associated_message")
+                    or confirmation.get("associatedMessage")
+                    or confirmation.get("message")
+                ),
+            }
+        )
+    return summary
+
+
 def _clear_cookie_if_present(session: requests.Session, domain: str, name: str) -> None:
     try:
         session.cookies.clear(domain=domain, path="/", name=name)
@@ -200,6 +229,13 @@ def _patched_login(self: LoginExecutor) -> requests.Session:
         "cookies": {},
     }
     response_info = _response_info(self._send_login_request())
+    self.session._steam_auth_debug["begin"] = {
+        "keys": sorted(response_info.keys()),
+        "has_client_id": bool(response_info.get("client_id")),
+        "has_request_id": bool(response_info.get("request_id")),
+        "has_steamid": bool(response_info.get("steamid")),
+        "allowed_confirmations": _allowed_confirmations_summary(response_info),
+    }
 
     if "access_token" in response_info and "refresh_token" in response_info:
         self.access_token = response_info["access_token"]
@@ -302,6 +338,7 @@ def _patched_update_steam_guard(self: LoginExecutor, response_info: dict[str, An
     request_id = response_info["request_id"]
     steam_id = response_info.get("steamid")
     one_time_code = guard.generate_one_time_code(self.shared_secret)
+    debug = getattr(self.session, "_steam_auth_debug", None)
 
     data = {
         "client_id": client_id,
@@ -311,11 +348,28 @@ def _patched_update_steam_guard(self: LoginExecutor, response_info: dict[str, An
     if steam_id:
         data["steamid"] = steam_id
 
+    if debug is not None:
+        debug["steam_guard_code"] = {
+            "submitted": True,
+            "code_type": MOBILE_APP_CODE_TYPE,
+            "code_type_name": MOBILE_APP_CODE_TYPE_NAME,
+            "steamid_present": bool(steam_id),
+        }
+
     response = self._api_call("POST", "IAuthenticationService", "UpdateAuthSessionWithSteamGuardCode", params=data)
+    if debug is not None:
+        debug["steam_guard_code"]["status_code"] = response.status_code
     if response.status_code != HTTPStatus.OK:
         raise ApiException(f"Steam Guard update failed with status {response.status_code}: {response.text[:300]}")
 
     payload = _response_json(response)
+    if debug is not None:
+        response_info_debug = payload.get("response")
+        debug["steam_guard_code"]["response_keys"] = (
+            sorted(response_info_debug.keys())
+            if isinstance(response_info_debug, dict)
+            else sorted(payload.keys())
+        )
     if payload.get("success") is False:
         raise ApiException(f"Steam Guard rejected the code: {payload.get('message', payload)}")
 
@@ -323,7 +377,11 @@ def _patched_update_steam_guard(self: LoginExecutor, response_info: dict[str, An
 
 
 def _patched_pool_sessions_steam(self: LoginExecutor, client_id: str, request_id: str) -> None:
-    for _ in range(20):
+    debug = getattr(self.session, "_steam_auth_debug", None)
+    if debug is not None:
+        debug.setdefault("poll", [])
+
+    for attempt in range(1, 21):
         response = self._api_call(
             "POST",
             "IAuthenticationService",
@@ -335,6 +393,25 @@ def _patched_pool_sessions_steam(self: LoginExecutor, client_id: str, request_id
 
         payload = _response_json(response)
         response_info = payload.get("response", {})
+        if debug is not None:
+            debug["poll"].append(
+                {
+                    "attempt": attempt,
+                    "status_code": response.status_code,
+                    "response_keys": sorted(response_info.keys())
+                    if isinstance(response_info, dict)
+                    else [],
+                    "has_access_token": bool(response_info.get("access_token"))
+                    if isinstance(response_info, dict)
+                    else False,
+                    "has_refresh_token": bool(response_info.get("refresh_token"))
+                    if isinstance(response_info, dict)
+                    else False,
+                    "had_remote_interaction": response_info.get("had_remote_interaction")
+                    if isinstance(response_info, dict)
+                    else None,
+                }
+            )
         if response_info.get("access_token") and response_info.get("refresh_token"):
             self.access_token = response_info["access_token"]
             self.refresh_token = response_info["refresh_token"]
