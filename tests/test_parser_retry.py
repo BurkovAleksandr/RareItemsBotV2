@@ -149,6 +149,64 @@ def test_normalize_new_market_listings_maps_new_page_shape():
     ]
 
 
+def test_parser_prefers_accessory_sticker_metadata_with_wear():
+    listing_info = normalize_new_market_listings(
+        [
+            {
+                "listingid": "listing-1",
+                "unPrice": 100,
+                "unFee": 15,
+                "eCurrency": 5,
+                "description": {
+                    "market_hash_name": "AK-47 | Slate (Field-Tested)",
+                    "market_actions": [
+                        {
+                            "link": "steam://inspect/%listingid%/%assetid%",
+                            "name": "Inspect in Game...",
+                        }
+                    ],
+                    "descriptions": [
+                        {
+                            "name": "sticker_info",
+                            "value": '<img title="Sticker: Sticker | From Html" src="html.png">',
+                        }
+                    ],
+                },
+                "asset": {
+                    "appid": 730,
+                    "contextid": "2",
+                    "id": "asset-1",
+                    "accessory_properties": [
+                        {
+                            "classid": "worn-sticker",
+                            "parent_relationship_properties": [
+                                {"propertyid": 4, "float_value": 1}
+                            ],
+                            "description": {
+                                "type": "High Grade Sticker",
+                                "market_hash_name": "Sticker | From Accessory",
+                                "icon_url": "accessory.png",
+                            },
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+
+    parser = AsyncParser(FakeSteamSession([]), request_timeout=1)
+    items = parser.extract_item_data(listing_info)
+
+    assert items[0]["stickers"] == [
+        {
+            "name": "Sticker | From Accessory",
+            "icon_url": "accessory.png",
+            "classid": "worn-sticker",
+            "wear": 1,
+        }
+    ]
+
+
 def test_async_parser_gets_market_page_and_parses_embedded_listings():
     listings = [
         {

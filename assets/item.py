@@ -4,6 +4,27 @@ from assets.inspect import IItemInfoFetcher
 from assets.prices import IItemPriceFetcher
 
 
+def sticker_wear_value(sticker: dict) -> float | None:
+    raw_wear = (
+        sticker.get("wear")
+        if sticker.get("wear") not in (None, "")
+        else sticker.get("wear_value")
+    )
+    if raw_wear in (None, ""):
+        return None
+    if isinstance(raw_wear, str):
+        raw_wear = raw_wear.strip().replace("%", "")
+    try:
+        return float(raw_wear)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_clean_sticker(sticker: dict) -> bool:
+    wear = sticker_wear_value(sticker)
+    return wear is None or wear <= 0
+
+
 class StickerStrick:
     def __init__(self):
         self.strick = False
@@ -103,7 +124,7 @@ class ItemData:
         stickers = item_info.get("stickers", [])
         res_stickers = []
         for sticker in stickers:
-            if not sticker.get("wear", None):
+            if is_clean_sticker(sticker):
                 res_stickers.append(sticker)
         return res_stickers
 
@@ -168,8 +189,7 @@ class AsyncItemData:
 
     def extract_sticker_info(self, item_info):
         stickers = item_info.get("stickers", [])
-        print(stickers)
-        return stickers
+        return [sticker for sticker in stickers if is_clean_sticker(sticker)]
 
     def extract_charm_info(self, item_info):
         return item_info.get("charm", {})

@@ -221,11 +221,11 @@ def _extract_accessories(asset: dict[str, Any], kind: str) -> list[dict[str, Any
     return accessories
 
 
-def extract_stickers(asset: dict[str, Any]) -> list[dict[str, str]]:
-    stickers = _extract_titled_images(
-        _description_html(asset, "sticker_info"), "Sticker:"
-    )
-    return stickers or _extract_accessories(asset, "Sticker")
+def extract_stickers(asset: dict[str, Any]) -> list[dict[str, Any]]:
+    accessories = _extract_accessories(asset, "Sticker")
+    if accessories:
+        return accessories
+    return _extract_titled_images(_description_html(asset, "sticker_info"), "Sticker:")
 
 
 def extract_charm(asset: dict[str, Any]) -> dict[str, str]:
