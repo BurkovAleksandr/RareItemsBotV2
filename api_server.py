@@ -14,8 +14,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from steampy.models import GameOptions
 
 
+from assets.inventory import (
+    build_inventory_cards,
+    CS_INVENTORY_GAME,
+    fetch_steam_inventory,
+    fetch_market_price,
+    normalize_active_listings,
+    target_buyer_price_to_receive,
+)
 from assets.database import SqliteItemsRepository
 from web_app import (
     AsyncBotController,
@@ -45,6 +54,12 @@ class ProxiesPayload(BaseModel):
 
 class ConfigPayload(BaseModel):
     config: dict[str, Any]
+
+
+class SellInventoryPayload(BaseModel):
+    purchase_id: int
+    asset_id: str
+    price: float
 
 
 def sanitize_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -158,6 +173,43 @@ def repository_from_config(config: dict[str, Any]) -> SqliteItemsRepository:
     return SqliteItemsRepository(str(config.get("DB_PATH") or "./db.db"))
 
 
+def load_steam_session_from_config(config: dict[str, Any], role: str):
+    from assets.session import AsyncSteamSession, SteamPyClient
+
+    login = str(config.get(f"{role}_LOGIN") or "").strip()
+    if not login:
+        raise RuntimeError(f"{role} login is not configured")
+    session = AsyncSteamSession(
+        SteamPyClient(),
+        login,
+        str(config.get(f"{role}_PASSWORD") or ""),
+        str(config.get(f"{role}_MAFILE") or ""),
+        api_key=str(config.get("API_KEY") or ""),
+    )
+    session.load_client(str(config.get("ACCOUNTS_DIR") or "./accounts/"))
+    return session
+
+
+def get_buyer_session(state: ApiState):
+    bot = getattr(state.controller, "bot", None)
+    buyer_session = getattr(getattr(bot, "buy_module", None), "steam_session", None)
+    if buyer_session is not None:
+        return buyer_session
+    config = load_config_data(state.config_path)
+    return load_steam_session_from_config(config, "BUYER")
+
+
+def ensure_market_session(client: Any) -> None:
+    session_id = client._get_session_id()
+    if not session_id:
+        raise RuntimeError("Missing Steam sessionid cookie")
+    steam_guard = getattr(client, "steam_guard", None) or {}
+    if not steam_guard.get("steamid"):
+        steam_guard = {**steam_guard, "steamid": str(client.get_steam_id())}
+    if hasattr(client, "market") and hasattr(client.market, "_set_login_executed"):
+        client.market._set_login_executed(steam_guard, session_id)
+
+
 def build_dashboard_summary(
     state: ApiState,
     *,
@@ -267,10 +319,169 @@ def build_recent_purchases_payload(state: ApiState, limit: int = 8) -> dict[str,
     return {"items": purchases, "count": len(purchases)}
 
 
+def build_purchase_history_payload(
+    state: ApiState,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    min_stickers_price: float | None = None,
+    max_stickers_price: float | None = None,
+    min_item_price: float | None = None,
+    max_item_price: float | None = None,
+    success: bool | None = None,
+    listed: bool | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
+    purchases = repository_from_config(config).get_bought_items(
+        date_from=date_from,
+        date_to=date_to,
+        min_stickers_price=min_stickers_price,
+        max_stickers_price=max_stickers_price,
+        min_item_price=min_item_price,
+        max_item_price=max_item_price,
+        success=success,
+        listed=listed,
+        limit=limit,
+    )
+    return {"items": purchases, "count": len(purchases)}
+
+
 def build_recent_sticker_prices_payload(state: ApiState, limit: int = 8) -> dict[str, Any]:
     config = load_config_data(state.config_path)
     rows = repository_from_config(config).get_recent_sticker_prices(limit=limit)
     return {"rows": rows, "count": len(rows)}
+
+
+def build_inventory_payload(state: ApiState, include_prices: bool = True) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
+    repository = repository_from_config(config)
+    purchases = repository.get_bought_items(success=True, limit=None)
+    if not purchases:
+        return {"items": [], "count": 0, "errors": []}
+
+    errors = []
+    try:
+        steam_session = get_buyer_session(state)
+        if not steam_session.is_alive():
+            raise RuntimeError("Buyer Steam session is inactive")
+        client = steam_session.get_client()
+        ensure_market_session(client)
+        inventory = fetch_steam_inventory(client, CS_INVENTORY_GAME, merge=True)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Could not load Steam inventory: {type(exc).__name__}: {exc}") from exc
+
+    active_listings = {}
+    try:
+        active_listings = normalize_active_listings(client.market.get_my_market_listings())
+    except Exception as exc:
+        errors.append(f"Could not load active market listings: {type(exc).__name__}: {exc}")
+
+    price_cache: dict[str, float | None] = {}
+
+    def market_price_lookup(item_name: str) -> float | None:
+        if not include_prices:
+            return None
+        if item_name not in price_cache:
+            try:
+                price_cache[item_name] = fetch_market_price(client, item_name)
+            except Exception as exc:
+                price_cache[item_name] = None
+                errors.append(f"Could not load market price for {item_name}: {type(exc).__name__}: {exc}")
+        return price_cache[item_name]
+
+    items = build_inventory_cards(
+        purchases=purchases,
+        inventory=inventory,
+        active_listings=active_listings,
+        market_price_lookup=market_price_lookup,
+    )
+    return {"items": items, "count": len(items), "errors": errors}
+
+
+def sell_inventory_item(state: ApiState, payload: SellInventoryPayload) -> dict[str, Any]:
+    if payload.price <= 0:
+        raise HTTPException(status_code=400, detail="price must be greater than 0")
+    config = load_config_data(state.config_path)
+    repository = repository_from_config(config)
+    price_to_receive = target_buyer_price_to_receive(payload.price)
+    if price_to_receive <= 0:
+        raise HTTPException(status_code=400, detail="price_to_receive must be greater than 0")
+
+    try:
+        steam_session = get_buyer_session(state)
+        if not steam_session.is_alive():
+            raise RuntimeError("Buyer Steam session is inactive")
+        client = steam_session.get_client()
+        ensure_market_session(client)
+        response = client.market.create_sell_order(
+            payload.asset_id,
+            CS_INVENTORY_GAME,
+            str(int(round(price_to_receive * 100))),
+        )
+    except Exception as exc:
+        repository.record_sale_listing(
+            payload.purchase_id,
+            asset_id=payload.asset_id,
+            sell_price=payload.price,
+            sell_price_to_receive=price_to_receive,
+            status="error",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise HTTPException(status_code=502, detail=f"Could not create Steam sell listing: {type(exc).__name__}: {exc}") from exc
+
+    active_listing = {}
+    try:
+        active_listing = normalize_active_listings(client.market.get_my_market_listings()).get(payload.asset_id) or {}
+    except Exception:
+        active_listing = {}
+
+    sell_listing_id = str(
+        active_listing.get("listing_id")
+        or response.get("sellid")
+        or response.get("sell_listing_id")
+        or ""
+    )
+    pending = bool(
+        response.get("needs_mobile_confirmation")
+        or response.get("requires_confirmation")
+        or response.get("need_confirmation")
+    )
+    success = response.get("success") in (True, 1) or bool(sell_listing_id)
+    if not success and not pending:
+        message = response.get("message") or response
+        repository.record_sale_listing(
+            payload.purchase_id,
+            asset_id=payload.asset_id,
+            sell_price=payload.price,
+            sell_price_to_receive=price_to_receive,
+            status="error",
+            error=str(message),
+        )
+        raise HTTPException(status_code=502, detail=f"Steam rejected sell listing: {message}")
+
+    status = "listed" if sell_listing_id or success else "pending_confirmation"
+    repository.record_sale_listing(
+        payload.purchase_id,
+        asset_id=payload.asset_id,
+        sell_listing_id=sell_listing_id,
+        sell_price=payload.price,
+        sell_price_to_receive=price_to_receive,
+        status=status,
+        error="",
+    )
+    return {
+        "message": "Item listed on Steam" if status == "listed" else "Steam listing is awaiting confirmation",
+        "sale": {
+            "purchase_id": payload.purchase_id,
+            "asset_id": payload.asset_id,
+            "sell_listing_id": sell_listing_id,
+            "sell_price": payload.price,
+            "sell_price_to_receive": price_to_receive,
+            "status": status,
+            "listing": active_listing,
+        },
+    }
 
 
 def build_dashboard(state: ApiState) -> dict[str, Any]:
@@ -391,6 +602,39 @@ def create_app(config_path: str | None = None) -> FastAPI:
             limit=limit,
         )
         return {"items": items, "count": len(items)}
+
+    @app.get("/api/purchases")
+    def purchases(
+        date_from: str | None = None,
+        date_to: str | None = None,
+        min_stickers_price: float | None = None,
+        max_stickers_price: float | None = None,
+        min_item_price: float | None = None,
+        max_item_price: float | None = None,
+        success: bool | None = None,
+        listed: bool | None = None,
+        limit: int | None = Query(None, ge=1, le=50000),
+    ) -> dict[str, Any]:
+        return build_purchase_history_payload(
+            state,
+            date_from=date_from,
+            date_to=date_to,
+            min_stickers_price=min_stickers_price,
+            max_stickers_price=max_stickers_price,
+            min_item_price=min_item_price,
+            max_item_price=max_item_price,
+            success=success,
+            listed=listed,
+            limit=limit,
+        )
+
+    @app.get("/api/inventory")
+    def inventory(include_prices: bool = True) -> dict[str, Any]:
+        return build_inventory_payload(state, include_prices=include_prices)
+
+    @app.post("/api/inventory/sell")
+    def sell_inventory(payload: SellInventoryPayload) -> dict[str, Any]:
+        return sell_inventory_item(state, payload)
 
     @app.post("/api/bot/start")
     def start_bot() -> dict[str, str]:

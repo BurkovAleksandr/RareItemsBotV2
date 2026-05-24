@@ -51,6 +51,11 @@ button.danger {
   background: var(--danger);
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .boot {
   padding: 40px;
   color: var(--muted);
@@ -409,6 +414,15 @@ main {
   gap: 16px;
 }
 
+.inventory-view {
+  display: grid;
+  gap: 12px;
+}
+
+.inventory-head {
+  margin-bottom: 0;
+}
+
 .history-actions {
   display: flex;
   flex-wrap: wrap;
@@ -520,6 +534,117 @@ main {
   overflow-wrap: anywhere;
 }
 
+.inventory-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.inventory-card {
+  border: 1px solid var(--border);
+  border-left: 4px solid #94a3b8;
+  border-radius: 8px;
+  background: white;
+  padding: 12px;
+  min-width: 0;
+}
+
+.inventory-card.listed {
+  border-left-color: var(--ok);
+}
+
+.inventory-card.locked {
+  border-left-color: var(--warn);
+}
+
+.inventory-main {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.inventory-main img {
+  width: 72px;
+  height: 54px;
+  object-fit: contain;
+  border-radius: 6px;
+  background: #f8fafc;
+  border: 1px solid var(--border);
+}
+
+.inventory-card h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.inventory-card a {
+  color: var(--blue);
+  text-decoration: none;
+}
+
+.inventory-card a:hover {
+  text-decoration: underline;
+}
+
+.trade-lock,
+.listing-state {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 10px;
+  padding: 8px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.trade-lock {
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  color: #854d0e;
+}
+
+.listing-state {
+  border: 1px solid #b6d7c9;
+  background: #ecfdf3;
+  color: #14532d;
+}
+
+.sell-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: end;
+  margin-top: 12px;
+}
+
+.sell-form label {
+  min-width: 0;
+}
+
+.sell-form span,
+.formula-line {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sell-form input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: #18212f;
+  background: white;
+}
+
+.formula-line {
+  margin-top: 8px;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -611,7 +736,8 @@ th {
 @media (max-width: 1180px) {
   .metric-grid,
   .timeline,
-  .history-grid {
+  .history-grid,
+  .inventory-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -637,16 +763,32 @@ th {
 
   .metric-grid,
   .timeline,
-  .checked-grid,
-  .history-grid,
-  .filters-grid,
-  .two-col,
+    .checked-grid,
+    .history-grid,
+    .inventory-grid,
+    .filters-grid,
+    .two-col,
   .config-grid {
     grid-template-columns: 1fr;
   }
 
   .checked-title,
-  .streak-line {
+  .streak-line,
+  .sell-form {
     flex-direction: column;
+  }
+
+  .sell-form {
+    display: flex;
+    align-items: stretch;
+  }
+
+  .inventory-main {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+
+  .inventory-main img {
+    width: 56px;
+    height: 44px;
   }
 }

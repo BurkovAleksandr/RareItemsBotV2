@@ -47,6 +47,7 @@ def test_recent_bought_items_are_ordered_by_date(tmp_path):
     assert repository.count_bought_items() == 2
     assert repository.get_recent_bought_items(limit=1) == [
         {
+            "purchase_id": 2,
             "item_name": "Second item",
             "listing_id": "2",
             "price": "11.5",
@@ -63,6 +64,13 @@ def test_recent_bought_items_are_ordered_by_date(tmp_path):
                 "single_price": 0,
                 "sum_price": 0,
             },
+            "asset_id": "",
+            "sell_listing_id": "",
+            "sell_price": "",
+            "sell_price_to_receive": "",
+            "listed_at": "",
+            "sell_status": "",
+            "sell_error": "",
             "market_url": "https://steamcommunity.com/market/listings/730/Second%20item",
         }
     ]
@@ -85,6 +93,30 @@ def test_recent_bought_items_include_stickers(tmp_path):
     assert purchase["stickers"][0]["name"] == "Crown"
     assert purchase["stickers"][0]["price"] == 20
     assert purchase["stickers"][0]["market_url"].endswith("Sticker%20%7C%20Crown")
+
+
+def test_bought_items_filters_and_sale_state(tmp_path):
+    repository = SqliteItemsRepository(str(tmp_path / "items.db"))
+
+    repository.add_to_bought_items("AK-47 | Slate", "1", 100.0, 20.0, "2026-05-20 10:00:00")
+    repository.add_to_bought_items("Nova | Predator", "2", 10.0, 2.0, "2026-05-21 10:00:00")
+    purchase = repository.get_bought_items(min_stickers_price=10, success=True, limit=None)[0]
+    repository.record_sale_listing(
+        purchase["purchase_id"],
+        asset_id="asset-1",
+        sell_listing_id="listing-sell-1",
+        sell_price=150.0,
+        sell_price_to_receive=132.74,
+        status="listed",
+    )
+
+    listed = repository.get_bought_items(listed=True, limit=None)
+
+    assert len(listed) == 1
+    assert listed[0]["item_name"] == "AK-47 | Slate"
+    assert listed[0]["asset_id"] == "asset-1"
+    assert listed[0]["sell_listing_id"] == "listing-sell-1"
+    assert listed[0]["sell_price"] == "150.0"
 
 
 def test_recent_checked_items_store_debug_details(tmp_path):

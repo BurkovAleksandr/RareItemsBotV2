@@ -107,24 +107,32 @@ def _checked_item_from_row(row) -> dict[str, object]:
 
 
 def _bought_item_from_row(row) -> dict[str, object]:
-    item_name = str(row[0] or "")
-    stickers = _parse_stickers(row[7])
+    item_name = str(row[1] or "")
+    stickers = _parse_stickers(row[8])
     for sticker in stickers:
         if isinstance(sticker, dict):
             sticker_name = str(sticker.get("name") or "")
             sticker["market_url"] = _sticker_market_url(sticker_name)
 
     return {
+        "purchase_id": int(row[0]),
         "item_name": item_name,
-        "listing_id": str(row[1] or ""),
-        "price": "" if row[2] is None else str(row[2]),
-        "stickers_price": "" if row[3] is None else str(row[3]),
-        "date": str(row[4] or ""),
-        "success": bool(row[5]),
-        "status": "success" if row[5] else "failed",
-        "error": str(row[6] or ""),
+        "listing_id": str(row[2] or ""),
+        "price": "" if row[3] is None else str(row[3]),
+        "stickers_price": "" if row[4] is None else str(row[4]),
+        "date": str(row[5] or ""),
+        "success": bool(row[6]),
+        "status": "success" if row[6] else "failed",
+        "error": str(row[7] or ""),
         "stickers": stickers,
         "streak": _streak_info(stickers),
+        "asset_id": str(row[9] or ""),
+        "sell_listing_id": str(row[10] or ""),
+        "sell_price": "" if row[11] is None else str(row[11]),
+        "sell_price_to_receive": "" if row[12] is None else str(row[12]),
+        "listed_at": str(row[13] or ""),
+        "sell_status": str(row[14] or ""),
+        "sell_error": str(row[15] or ""),
         "market_url": _market_url(item_name) if item_name else "",
     }
 
@@ -193,6 +201,13 @@ class SqliteItemsRepository:
             self._ensure_column("BoughtItems", "success", "INTEGER DEFAULT 1")
             self._ensure_column("BoughtItems", "error", "TEXT")
             self._ensure_column("BoughtItems", "stickers_json", "TEXT")
+            self._ensure_column("BoughtItems", "asset_id", "TEXT")
+            self._ensure_column("BoughtItems", "sell_listing_id", "TEXT")
+            self._ensure_column("BoughtItems", "sell_price", "REAL")
+            self._ensure_column("BoughtItems", "sell_price_to_receive", "REAL")
+            self._ensure_column("BoughtItems", "listed_at", "TEXT")
+            self._ensure_column("BoughtItems", "sell_status", "TEXT")
+            self._ensure_column("BoughtItems", "sell_error", "TEXT")
             self._dedupe_track_items()
             cur.execute(
                 """
@@ -457,16 +472,68 @@ class SqliteItemsRepository:
             self.db.commit()
 
     def get_recent_bought_items(self, limit: int = 10) -> list[dict[str, str]]:
+        return self.get_bought_items(limit=limit)
+
+    def get_bought_items(
+        self,
+        *,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        min_stickers_price: float | None = None,
+        max_stickers_price: float | None = None,
+        min_item_price: float | None = None,
+        max_item_price: float | None = None,
+        success: bool | None = None,
+        listed: bool | None = None,
+        limit: int | None = 10,
+    ) -> list[dict[str, object]]:
+        clauses = []
+        params: list[object] = []
+        if date_from:
+            clauses.append("date >= ?")
+            params.append(str(date_from))
+        if date_to:
+            clauses.append("date <= ?")
+            params.append(str(date_to))
+        if min_stickers_price is not None:
+            clauses.append("stickers_price >= ?")
+            params.append(float(min_stickers_price))
+        if max_stickers_price is not None:
+            clauses.append("stickers_price <= ?")
+            params.append(float(max_stickers_price))
+        if min_item_price is not None:
+            clauses.append("price >= ?")
+            params.append(float(min_item_price))
+        if max_item_price is not None:
+            clauses.append("price <= ?")
+            params.append(float(max_item_price))
+        if success is not None:
+            clauses.append("success = ?")
+            params.append(1 if success else 0)
+        if listed is True:
+            clauses.append("(sell_listing_id IS NOT NULL AND sell_listing_id != '')")
+        elif listed is False:
+            clauses.append("(sell_listing_id IS NULL OR sell_listing_id = '')")
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(max(1, int(limit)))
+
         with self.lock:
             rows = self.db.execute(
-                """
-                SELECT item_name, listing_id, price, stickers_price, date, success, error,
-                       stickers_json
+                f"""
+                SELECT rowid, item_name, listing_id, price, stickers_price, date,
+                       success, error, stickers_json, asset_id, sell_listing_id,
+                       sell_price, sell_price_to_receive, listed_at, sell_status,
+                       sell_error
                 FROM BoughtItems
+                {where_sql}
                 ORDER BY date DESC
-                LIMIT ?
+                {limit_sql}
                 """,
-                (max(1, int(limit)),),
+                params,
             ).fetchall()
 
         return [_bought_item_from_row(row) for row in rows]
@@ -474,6 +541,47 @@ class SqliteItemsRepository:
     def count_bought_items(self) -> int:
         with self.lock:
             return int(self.db.execute("SELECT COUNT(*) FROM BoughtItems").fetchone()[0])
+
+    def record_sale_listing(
+        self,
+        purchase_id: int,
+        *,
+        asset_id: str,
+        sell_listing_id: str = "",
+        sell_price: float | None = None,
+        sell_price_to_receive: float | None = None,
+        listed_at: str | datetime | None = None,
+        status: str = "listed",
+        error: str = "",
+    ) -> None:
+        if isinstance(listed_at, datetime):
+            listed_at = listed_at.isoformat(sep=" ", timespec="seconds")
+        listed_at = str(listed_at or datetime.now().isoformat(sep=" ", timespec="seconds"))
+        with self.lock:
+            self.db.execute(
+                """
+                UPDATE BoughtItems
+                SET asset_id = ?,
+                    sell_listing_id = ?,
+                    sell_price = ?,
+                    sell_price_to_receive = ?,
+                    listed_at = ?,
+                    sell_status = ?,
+                    sell_error = ?
+                WHERE rowid = ?
+                """,
+                (
+                    str(asset_id or ""),
+                    str(sell_listing_id or ""),
+                    sell_price,
+                    sell_price_to_receive,
+                    listed_at,
+                    str(status or ""),
+                    str(error or ""),
+                    int(purchase_id),
+                ),
+            )
+            self.db.commit()
 
     def count_sticker_prices(self) -> int:
         with self.lock:
@@ -556,8 +664,14 @@ class Items:
     def get_recent_bought_items(self, limit=10):
         return self.repository.get_recent_bought_items(limit)
 
+    def get_bought_items(self, **kwargs):
+        return self.repository.get_bought_items(**kwargs)
+
     def count_bought_items(self):
         return self.repository.count_bought_items()
+
+    def record_sale_listing(self, *args, **kwargs):
+        return self.repository.record_sale_listing(*args, **kwargs)
 
     def count_sticker_prices(self):
         return self.repository.count_sticker_prices()

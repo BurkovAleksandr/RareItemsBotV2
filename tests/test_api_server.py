@@ -133,3 +133,49 @@ def test_checked_items_endpoint_filters_streaks(tmp_path):
     assert payload["count"] == 1
     assert payload["items"][0]["listing_id"] == "listing-1"
     assert payload["items"][0]["streak"]["count"] == 3
+
+
+def test_purchases_endpoint_filters_and_returns_sale_state(tmp_path):
+    config_path = tmp_path / "config.json"
+    db_path = tmp_path / "items.db"
+    write_config_data(str(config_path), {"DB_PATH": str(db_path), "USE_PROXIES": False})
+
+    repository = SqliteItemsRepository(str(db_path))
+    repository.add_to_bought_items(
+        "AK-47 | Redline",
+        "listing-1",
+        20.0,
+        35.0,
+        "2026-05-20 11:00:00",
+        stickers=[{"name": "Sticker | Crown", "price": 35}],
+    )
+    repository.add_to_bought_items(
+        "Nova | Predator",
+        "listing-2",
+        15.0,
+        5.0,
+        "2026-05-21 11:00:00",
+        success=False,
+        error="sold",
+    )
+    purchase = repository.get_bought_items(success=True, limit=None)[0]
+    repository.record_sale_listing(
+        purchase["purchase_id"],
+        asset_id="asset-1",
+        sell_listing_id="sell-1",
+        sell_price=60.0,
+        sell_price_to_receive=53.1,
+    )
+
+    app = create_app(str(config_path))
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/purchases",
+            params={"success": "true", "listed": "true", "min_stickers_price": 30},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 1
+    assert payload["items"][0]["item_name"] == "AK-47 | Redline"
+    assert payload["items"][0]["sell_listing_id"] == "sell-1"
