@@ -1,10 +1,38 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const api = {
-  async getDashboard() {
-    const response = await fetch("/api/dashboard");
-    if (!response.ok) throw new Error(`Dashboard request failed: ${response.status}`);
-    return response.json();
+  async getJson(path, label) {
+    const response = await fetch(path);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || `${label} request failed: ${response.status}`);
+    return data;
+  },
+  async getDashboardSummary() {
+    return this.getJson("/api/dashboard/summary", "Dashboard summary");
+  },
+  async getRuntime() {
+    return this.getJson("/api/dashboard/runtime", "Runtime");
+  },
+  async getSessions() {
+    return this.getJson("/api/dashboard/sessions", "Sessions");
+  },
+  async getRecentChecked() {
+    return this.getJson("/api/dashboard/recent-checked", "Recent checked");
+  },
+  async getRecentPurchases() {
+    return this.getJson("/api/dashboard/recent-purchases", "Recent purchases");
+  },
+  async getStickerPrices() {
+    return this.getJson("/api/dashboard/sticker-prices", "Sticker prices");
+  },
+  async getConfig() {
+    return this.getJson("/api/dashboard/config", "Config");
+  },
+  async getTrackedItems() {
+    return this.getJson("/api/dashboard/tracked-items", "Tracked items");
+  },
+  async getProxies() {
+    return this.getJson("/api/dashboard/proxies", "Proxies");
   },
   async getCheckedItems(filters) {
     const params = new URLSearchParams();
@@ -92,8 +120,14 @@ function stickerSlot(sticker, index) {
 
 function App() {
   const [view, setView] = useState("dashboard");
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [summary, setSummary] = useState(null);
+  const [sessions, setSessions] = useState({});
+  const [runtime, setRuntime] = useState({ steps: [] });
+  const [recentCheckedItems, setRecentCheckedItems] = useState([]);
+  const [recentPurchases, setRecentPurchases] = useState([]);
+  const [recentStickerPrices, setRecentStickerPrices] = useState([]);
+  const [configFields, setConfigFields] = useState([]);
+  const [sectionLoading, setSectionLoading] = useState({});
   const [historyLoading, setHistoryLoading] = useState(false);
   const [checkedHistory, setCheckedHistory] = useState({ items: [], count: 0 });
   const [historyFilters, setHistoryFilters] = useState(DEFAULT_HISTORY_FILTERS);
@@ -107,24 +141,81 @@ function App() {
   const [useProxies, setUseProxies] = useState(false);
   const formsInitialized = useRef(false);
 
-  async function refresh() {
-    setLoading(true);
-    setError("");
+  async function loadSection(name, request, apply) {
+    setSectionLoading((current) => ({ ...current, [name]: true }));
     try {
-      const next = await api.getDashboard();
-      setData(next);
-      if (!formsInitialized.current) {
-        setItemsText(next.items_text || "");
-        setProxiesText(next.proxies_text || "");
-        setConfigDraft(next.config || {});
-        setUseProxies(Boolean(next.dashboard?.proxies_enabled));
-        formsInitialized.current = true;
-      }
+      const payload = await request();
+      apply(payload);
+      return payload;
     } catch (err) {
       setError(err.message);
+      return null;
     } finally {
-      setLoading(false);
+      setSectionLoading((current) => ({ ...current, [name]: false }));
     }
+  }
+
+  function refreshSummary() {
+    return loadSection("summary", () => api.getDashboardSummary(), setSummary);
+  }
+
+  function refreshRuntime() {
+    return loadSection("runtime", () => api.getRuntime(), (payload) => setRuntime(payload.runtime || { steps: [] }));
+  }
+
+  function refreshSessions() {
+    return loadSection("sessions", () => api.getSessions(), (payload) => setSessions(payload.sessions || {}));
+  }
+
+  function refreshRecentChecked() {
+    return loadSection("recentChecked", () => api.getRecentChecked(), (payload) => setRecentCheckedItems(payload.items || []));
+  }
+
+  function refreshRecentPurchases() {
+    return loadSection("recentPurchases", () => api.getRecentPurchases(), (payload) => setRecentPurchases(payload.items || []));
+  }
+
+  function refreshStickerPrices() {
+    return loadSection("stickerPrices", () => api.getStickerPrices(), (payload) => setRecentStickerPrices(payload.rows || []));
+  }
+
+  function refreshConfig() {
+    return loadSection("config", () => api.getConfig(), (payload) => {
+      setConfigFields(payload.config_fields || []);
+      setConfigDraft(payload.config || {});
+    });
+  }
+
+  function refreshTrackedItems() {
+    return loadSection("trackedItems", () => api.getTrackedItems(), (payload) => {
+      setItemsText(payload.items_text || "");
+    });
+  }
+
+  function refreshProxies() {
+    return loadSection("proxies", () => api.getProxies(), (payload) => {
+      setProxiesText(payload.proxies_text || "");
+      setUseProxies(Boolean(payload.proxies_enabled));
+    });
+  }
+
+  async function refreshAll({ includeForms = false } = {}) {
+    setError("");
+    const requests = [
+      refreshSummary(),
+      refreshRuntime(),
+      refreshSessions(),
+      refreshRecentChecked(),
+      refreshRecentPurchases(),
+      refreshStickerPrices(),
+    ];
+
+    if (includeForms || !formsInitialized.current) {
+      requests.push(refreshConfig(), refreshTrackedItems(), refreshProxies());
+      formsInitialized.current = true;
+    }
+
+    await Promise.all(requests);
   }
 
   async function refreshHistory(filters = historyFilters) {
@@ -147,7 +238,14 @@ function App() {
       if (result.config) {
         setConfigDraft(result.config);
       }
-      await refresh();
+      await Promise.all([
+        refreshSummary(),
+        refreshRuntime(),
+        refreshSessions(),
+        refreshRecentChecked(),
+        refreshRecentPurchases(),
+        refreshStickerPrices(),
+      ]);
       if (view === "history") {
         await refreshHistory();
       }
@@ -157,8 +255,15 @@ function App() {
   }
 
   useEffect(() => {
-    refresh();
-    const timer = setInterval(refresh, 5000);
+    refreshAll();
+    const timer = setInterval(() => {
+      refreshSummary();
+      refreshRuntime();
+      refreshSessions();
+      refreshRecentChecked();
+      refreshRecentPurchases();
+      refreshStickerPrices();
+    }, 5000);
     return () => clearInterval(timer);
   }, []);
 
@@ -169,38 +274,36 @@ function App() {
   }, [view]);
 
   const metrics = useMemo(() => {
-    if (!data) return [];
-    const d = data.dashboard;
+    if (!summary) return [];
+    const d = summary.dashboard;
+    const buyerSession = sessions.buyer_session || {};
+    const parserSession = sessions.parser_session || {};
     return [
-      { label: "Bot", value: d.bot_state, detail: data.status.started_at || "not started", state: d.bot_state_class },
+      { label: "Bot", value: d.bot_state, detail: summary.status.started_at || "not started", state: d.bot_state_class },
       {
         label: "Buyer session",
-        value: d.buyer_session.active === true ? "ACTIVE" : d.buyer_session.active === false ? "INACTIVE" : "UNKNOWN",
-        detail: `${d.buyer_session.login} / ${d.buyer_session.error || d.buyer_session.source}`,
-        state: stateClass(d.buyer_session.active),
+        value: buyerSession.active === true ? "ACTIVE" : buyerSession.active === false ? "INACTIVE" : "UNKNOWN",
+        detail: `${buyerSession.login || "-"} / ${buyerSession.error || buyerSession.source || "loading"}`,
+        state: stateClass(buyerSession.active),
       },
       {
         label: "Parser session",
-        value: d.parser_session.active === true ? "ACTIVE" : d.parser_session.active === false ? "INACTIVE" : "UNKNOWN",
-        detail: `${d.parser_session.login} / ${d.parser_session.error || d.parser_session.source}`,
-        state: stateClass(d.parser_session.active),
+        value: parserSession.active === true ? "ACTIVE" : parserSession.active === false ? "INACTIVE" : "UNKNOWN",
+        detail: `${parserSession.login || "-"} / ${parserSession.error || parserSession.source || "loading"}`,
+        state: stateClass(parserSession.active),
       },
       {
         label: "Balance",
-        value: formatValue(d.buyer_session.wallet_balance, " RUB"),
+        value: formatValue(buyerSession.wallet_balance, " RUB"),
         detail: "buyer wallet",
-        state: d.buyer_session.wallet_balance ? "ok" : "idle",
+        state: buyerSession.wallet_balance ? "ok" : "idle",
       },
       { label: "Tracked", value: d.tracked_count, detail: `${d.proxy_count} proxies`, state: d.tracked_count ? "ok" : "warn" },
-      { label: "Purchases", value: d.purchase_count, detail: `${d.recent_purchase_count} visible`, state: d.purchase_count ? "ok" : "idle" },
-      { label: "Sticker prices", value: d.sticker_price_count, detail: `${d.recent_sticker_price_count} recent rows`, state: d.sticker_price_count ? "ok" : "warn" },
-      { label: "Checked", value: d.recent_checked_count, detail: "debug listings", state: d.recent_checked_count ? "ok" : "idle" },
+      { label: "Purchases", value: d.purchase_count, detail: `${recentPurchases.length} visible`, state: d.purchase_count ? "ok" : "idle" },
+      { label: "Sticker prices", value: d.sticker_price_count, detail: `${recentStickerPrices.length} recent rows`, state: d.sticker_price_count ? "ok" : "warn" },
+      { label: "Checked", value: recentCheckedItems.length, detail: "debug listings", state: recentCheckedItems.length ? "ok" : "idle" },
     ];
-  }, [data]);
-
-  if (loading && !data) {
-    return <div className="boot">Loading RareItemsBot dashboard...</div>;
-  }
+  }, [summary, sessions, recentCheckedItems.length, recentPurchases.length, recentStickerPrices.length]);
 
   return (
     <div className="app">
@@ -210,7 +313,7 @@ function App() {
           <p>Steam market control dashboard</p>
         </div>
         <div className="top-actions">
-          <button className="ghost" onClick={refresh}>Refresh</button>
+          <button className="ghost" onClick={() => refreshAll({ includeForms: true })}>Refresh</button>
           <button onClick={() => runAction(() => api.post("/api/bot/start"))}>Start</button>
           <button className="danger" onClick={() => runAction(() => api.post("/api/bot/stop"))}>Stop</button>
         </div>
@@ -228,8 +331,13 @@ function App() {
       <main>
         {view === "dashboard" ? (
           <DashboardView
-            data={data}
             metrics={metrics}
+            runtime={runtime}
+            recentCheckedItems={recentCheckedItems}
+            recentPurchases={recentPurchases}
+            recentStickerPrices={recentStickerPrices}
+            configFields={configFields}
+            sectionLoading={sectionLoading}
             configDraft={configDraft}
             setConfigDraft={setConfigDraft}
             itemsText={itemsText}
@@ -264,8 +372,13 @@ function App() {
 }
 
 function DashboardView({
-  data,
   metrics,
+  runtime,
+  recentCheckedItems,
+  recentPurchases,
+  recentStickerPrices,
+  configFields,
+  sectionLoading,
   configDraft,
   setConfigDraft,
   itemsText,
@@ -284,6 +397,13 @@ function DashboardView({
   return (
     <>
       <section className="metric-grid">
+        {metrics.length === 0 && (
+          <article className="metric idle">
+            <span>Dashboard</span>
+            <strong>Loading</strong>
+            <small>summary request</small>
+          </article>
+        )}
         {metrics.map((metric) => (
           <article className={`metric ${metric.state}`} key={metric.label}>
             <span>{metric.label}</span>
@@ -298,7 +418,9 @@ function DashboardView({
           <h2>Startup checkpoints</h2>
         </div>
         <div className="timeline">
-          {(data?.dashboard.runtime.steps || []).map((step) => (
+          {sectionLoading.runtime && (runtime.steps || []).length === 0 && <p className="empty">Loading checkpoints...</p>}
+          {!sectionLoading.runtime && (runtime.steps || []).length === 0 && <p className="empty">No checkpoints yet.</p>}
+          {(runtime.steps || []).map((step) => (
             <details className={`checkpoint ${step.status}`} key={step.id}>
               <summary><span className="dot" />{step.label}</summary>
               <p>{step.detail || step.status}</p>
@@ -318,8 +440,9 @@ function DashboardView({
           <button className="ghost" onClick={() => setView("history")}>Open history</button>
         </div>
         <div className="checked-grid">
-          {(data?.recent_checked_items || []).length === 0 && <p className="empty">No checked listings yet.</p>}
-          {(data?.recent_checked_items || []).map((item) => (
+          {sectionLoading.recentChecked && recentCheckedItems.length === 0 && <p className="empty">Loading checked listings...</p>}
+          {!sectionLoading.recentChecked && recentCheckedItems.length === 0 && <p className="empty">No checked listings yet.</p>}
+          {recentCheckedItems.map((item) => (
             <CheckedItemCard item={item} compact key={`${item.listing_id}-${item.checked_at}`} />
           ))}
         </div>
@@ -328,12 +451,13 @@ function DashboardView({
       <section className="two-col">
         <div className="panel">
           <h2>Recent purchases</h2>
-          <PurchaseGrid purchases={data?.recent_purchases || []} />
+          <PurchaseGrid purchases={recentPurchases} loading={sectionLoading.recentPurchases} />
         </div>
         <div className="panel">
           <h2>Sticker prices</h2>
           <DataTable
-            rows={data?.recent_sticker_prices || []}
+            rows={recentStickerPrices}
+            loading={sectionLoading.stickerPrices}
             columns={[
               ["name", "Sticker"],
               ["price", "Price"],
@@ -353,7 +477,8 @@ function DashboardView({
             <button type="submit">Save config</button>
           </div>
           <div className="config-grid">
-            {(data?.config_fields || []).map((field) => (
+            {sectionLoading.config && configFields.length === 0 && <p className="empty">Loading config...</p>}
+            {configFields.map((field) => (
               <ConfigField
                 field={field}
                 value={configDraft[field.name]}
@@ -525,7 +650,8 @@ function CheckedItemCard({ item, compact = false }) {
   );
 }
 
-function PurchaseGrid({ purchases }) {
+function PurchaseGrid({ purchases, loading = false }) {
+  if (loading && !purchases.length) return <p className="empty">Loading purchases...</p>;
   if (!purchases.length) return <p className="empty">No purchase attempts yet.</p>;
   return (
     <div className="purchase-grid">
@@ -538,6 +664,7 @@ function PurchaseGrid({ purchases }) {
 
 function PurchaseCard({ purchase }) {
   const success = Boolean(purchase.success);
+  const stickers = purchase.stickers || [];
   return (
     <article className={`purchase-card ${success ? "success" : "failed"}`}>
       <div className="checked-title">
@@ -557,6 +684,22 @@ function PurchaseCard({ purchase }) {
       <div className="kv checked-kv">
         <span>Buy price</span><b>{formatValue(purchase.price, " RUB")}</b>
         <span>Stickers</span><b>{formatValue(purchase.stickers_price, " RUB")}</b>
+      </div>
+      <div className="chips purchase-stickers">
+        {stickers.map((sticker, index) => (
+          <a
+            className="chip sticker-chip"
+            href={sticker.market_url || undefined}
+            target="_blank"
+            rel="noreferrer"
+            key={`${sticker.name}-${index}`}
+          >
+            <span className="slot">#{stickerSlot(sticker, index)}</span>
+            <span>{sticker.name || "unknown sticker"}</span>
+            <b>{formatValue(sticker.price, " RUB")}</b>
+          </a>
+        ))}
+        {stickers.length === 0 && <span className="chip">no stickers</span>}
       </div>
       {!success && (
         <div className="purchase-error">
@@ -595,7 +738,8 @@ function ConfigField({ field, value, onChange }) {
   );
 }
 
-function DataTable({ rows, columns }) {
+function DataTable({ rows, columns, loading = false }) {
+  if (loading && !rows.length) return <p className="empty">Loading rows...</p>;
   if (!rows.length) return <p className="empty">No rows yet.</p>;
   return (
     <table>

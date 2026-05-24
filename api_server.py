@@ -144,27 +144,34 @@ def inspect_steam_session(
     return summary
 
 
-def build_dashboard(state: ApiState) -> dict[str, Any]:
-    config = load_config_data(state.config_path)
-    db_path = str(config.get("DB_PATH") or "./db.db")
-    proxies_path = str(config.get("PROXIES_PATH") or "./proxies.txt")
-    repository = SqliteItemsRepository(db_path)
-    tracked_items = repository.get_track_items()
-    recent_purchases = repository.get_recent_bought_items(limit=8)
-    recent_checked_items = repository.get_recent_checked_items(limit=10)
-    recent_sticker_prices = repository.get_recent_sticker_prices(limit=8)
-    proxies_text = read_text_file(proxies_path)
-    proxy_count = len(
+def active_proxy_count(proxies_text: str) -> int:
+    return len(
         [
             line
             for line in proxies_text.splitlines()
             if line.strip() and not line.strip().startswith("#")
         ]
     )
+
+
+def repository_from_config(config: dict[str, Any]) -> SqliteItemsRepository:
+    return SqliteItemsRepository(str(config.get("DB_PATH") or "./db.db"))
+
+
+def build_dashboard_summary(
+    state: ApiState,
+    *,
+    recent_purchase_count: int | None = None,
+    recent_checked_count: int | None = None,
+    recent_sticker_price_count: int | None = None,
+    include_runtime: bool = False,
+    include_sessions: bool = False,
+) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
+    proxies_path = str(config.get("PROXIES_PATH") or "./proxies.txt")
+    repository = repository_from_config(config)
+    proxies_text = read_text_file(proxies_path)
     status = state.controller.status()
-    bot = getattr(state.controller, "bot", None)
-    buyer_session = getattr(getattr(bot, "buy_module", None), "steam_session", None)
-    parser_session = getattr(bot, "session", None)
 
     dashboard = {
         "bot_state": (
@@ -175,26 +182,43 @@ def build_dashboard(state: ApiState) -> dict[str, Any]:
         "bot_state_class": (
             "starting" if status["starting"] else "ok" if status["running"] else "idle"
         ),
-        "buyer_session": inspect_steam_session(
-            config, "BUYER", buyer_session, include_wallet=True
-        ),
-        "parser_session": inspect_steam_session(
-            config, "PARSER", parser_session, include_wallet=False
-        ),
-        "tracked_count": len(tracked_items),
+        "tracked_count": repository.count_track_items(),
         "purchase_count": repository.count_bought_items(),
-        "recent_purchase_count": len(recent_purchases),
-        "recent_checked_count": len(recent_checked_items),
+        "recent_purchase_count": recent_purchase_count,
+        "recent_checked_count": recent_checked_count,
         "sticker_price_count": repository.count_sticker_prices(),
-        "recent_sticker_price_count": len(recent_sticker_prices),
-        "proxy_count": proxy_count,
+        "recent_sticker_price_count": recent_sticker_price_count,
+        "proxy_count": active_proxy_count(proxies_text),
         "proxies_enabled": parse_bool(config.get("USE_PROXIES")),
-        "runtime": state.controller.runtime_status.snapshot(),
+    }
+    if include_runtime:
+        dashboard["runtime"] = state.controller.runtime_status.snapshot()
+    if include_sessions:
+        dashboard.update(build_sessions_payload(state)["sessions"])
+
+    return {"status": status, "dashboard": dashboard}
+
+
+def build_sessions_payload(state: ApiState) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
+    bot = getattr(state.controller, "bot", None)
+    buyer_session = getattr(getattr(bot, "buy_module", None), "steam_session", None)
+    parser_session = getattr(bot, "session", None)
+    return {
+        "sessions": {
+            "buyer_session": inspect_steam_session(
+                config, "BUYER", buyer_session, include_wallet=True
+            ),
+            "parser_session": inspect_steam_session(
+                config, "PARSER", parser_session, include_wallet=False
+            ),
+        }
     }
 
+
+def build_config_payload(state: ApiState) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
     return {
-        "status": status,
-        "dashboard": dashboard,
         "config": sanitize_config(config),
         "config_fields": [
             {
@@ -206,13 +230,76 @@ def build_dashboard(state: ApiState) -> dict[str, Any]:
             }
             for name, label, field_type, default in CONFIG_FIELDS
         ],
+    }
+
+
+def build_tracked_items_payload(state: ApiState) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
+    repository = repository_from_config(config)
+    tracked_items = repository.get_track_items()
+    return {
         "tracked_items": tracked_items,
         "items_text": serialize_track_items(tracked_items),
-        "recent_purchases": recent_purchases,
-        "recent_checked_items": recent_checked_items,
-        "recent_sticker_prices": recent_sticker_prices,
+    }
+
+
+def build_proxies_payload(state: ApiState) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
+    proxies_path = str(config.get("PROXIES_PATH") or "./proxies.txt")
+    proxies_text = read_text_file(proxies_path)
+    return {
         "proxies_text": proxies_text,
-        "paths": {"db": db_path, "proxies": proxies_path},
+        "proxy_count": active_proxy_count(proxies_text),
+        "proxies_enabled": parse_bool(config.get("USE_PROXIES")),
+        "paths": {"proxies": proxies_path},
+    }
+
+
+def build_recent_checked_payload(state: ApiState, limit: int = 10) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
+    items = repository_from_config(config).get_recent_checked_items(limit=limit)
+    return {"items": items, "count": len(items)}
+
+
+def build_recent_purchases_payload(state: ApiState, limit: int = 8) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
+    purchases = repository_from_config(config).get_recent_bought_items(limit=limit)
+    return {"items": purchases, "count": len(purchases)}
+
+
+def build_recent_sticker_prices_payload(state: ApiState, limit: int = 8) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
+    rows = repository_from_config(config).get_recent_sticker_prices(limit=limit)
+    return {"rows": rows, "count": len(rows)}
+
+
+def build_dashboard(state: ApiState) -> dict[str, Any]:
+    config = load_config_data(state.config_path)
+    db_path = str(config.get("DB_PATH") or "./db.db")
+    recent_purchases_payload = build_recent_purchases_payload(state)
+    recent_checked_payload = build_recent_checked_payload(state)
+    recent_sticker_prices_payload = build_recent_sticker_prices_payload(state)
+    summary = build_dashboard_summary(
+        state,
+        recent_purchase_count=recent_purchases_payload["count"],
+        recent_checked_count=recent_checked_payload["count"],
+        recent_sticker_price_count=recent_sticker_prices_payload["count"],
+        include_runtime=True,
+        include_sessions=True,
+    )
+    config_payload = build_config_payload(state)
+    tracked_items_payload = build_tracked_items_payload(state)
+    proxies_payload = build_proxies_payload(state)
+
+    return {
+        **summary,
+        **config_payload,
+        **tracked_items_payload,
+        "recent_purchases": recent_purchases_payload["items"],
+        "recent_checked_items": recent_checked_payload["items"],
+        "recent_sticker_prices": recent_sticker_prices_payload["rows"],
+        "proxies_text": proxies_payload["proxies_text"],
+        "paths": {"db": db_path, "proxies": proxies_payload["paths"]["proxies"]},
     }
 
 
@@ -243,6 +330,42 @@ def create_app(config_path: str | None = None) -> FastAPI:
     @app.get("/api/dashboard")
     def dashboard() -> dict[str, Any]:
         return build_dashboard(state)
+
+    @app.get("/api/dashboard/summary")
+    def dashboard_summary() -> dict[str, Any]:
+        return build_dashboard_summary(state)
+
+    @app.get("/api/dashboard/runtime")
+    def dashboard_runtime() -> dict[str, Any]:
+        return {"runtime": state.controller.runtime_status.snapshot()}
+
+    @app.get("/api/dashboard/sessions")
+    def dashboard_sessions() -> dict[str, Any]:
+        return build_sessions_payload(state)
+
+    @app.get("/api/dashboard/recent-checked")
+    def dashboard_recent_checked(limit: int = Query(10, ge=1, le=100)) -> dict[str, Any]:
+        return build_recent_checked_payload(state, limit=limit)
+
+    @app.get("/api/dashboard/recent-purchases")
+    def dashboard_recent_purchases(limit: int = Query(8, ge=1, le=100)) -> dict[str, Any]:
+        return build_recent_purchases_payload(state, limit=limit)
+
+    @app.get("/api/dashboard/sticker-prices")
+    def dashboard_sticker_prices(limit: int = Query(8, ge=1, le=100)) -> dict[str, Any]:
+        return build_recent_sticker_prices_payload(state, limit=limit)
+
+    @app.get("/api/dashboard/config")
+    def dashboard_config() -> dict[str, Any]:
+        return build_config_payload(state)
+
+    @app.get("/api/dashboard/tracked-items")
+    def dashboard_tracked_items() -> dict[str, Any]:
+        return build_tracked_items_payload(state)
+
+    @app.get("/api/dashboard/proxies")
+    def dashboard_proxies() -> dict[str, Any]:
+        return build_proxies_payload(state)
 
     @app.get("/api/checked-items")
     def checked_items(

@@ -55,9 +55,36 @@ def test_recent_bought_items_are_ordered_by_date(tmp_path):
             "success": False,
             "status": "failed",
             "error": "Somebody already bought it",
+            "stickers": [],
+            "streak": {
+                "has_streak": False,
+                "name": "",
+                "count": 0,
+                "single_price": 0,
+                "sum_price": 0,
+            },
             "market_url": "https://steamcommunity.com/market/listings/730/Second%20item",
         }
     ]
+
+
+def test_recent_bought_items_include_stickers(tmp_path):
+    repository = SqliteItemsRepository(str(tmp_path / "items.db"))
+
+    repository.add_to_bought_items(
+        "AK-47 | Redline",
+        "listing-1",
+        10.5,
+        20.0,
+        "2026-05-20 10:00:00",
+        stickers=[{"name": "Crown", "price": 20}],
+    )
+
+    purchase = repository.get_recent_bought_items(limit=1)[0]
+
+    assert purchase["stickers"][0]["name"] == "Crown"
+    assert purchase["stickers"][0]["price"] == 20
+    assert purchase["stickers"][0]["market_url"].endswith("Sticker%20%7C%20Crown")
 
 
 def test_recent_checked_items_store_debug_details(tmp_path):

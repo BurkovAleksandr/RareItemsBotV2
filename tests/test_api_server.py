@@ -47,6 +47,52 @@ def test_build_dashboard_returns_core_payload(tmp_path):
     assert payload["items_text"] == ""
 
 
+def test_dashboard_block_endpoints_return_independent_payloads(tmp_path):
+    config_path = tmp_path / "config.json"
+    db_path = tmp_path / "items.db"
+    proxies_path = tmp_path / "proxies.txt"
+    proxies_path.write_text("127.0.0.1:8080\n# ignored\n", encoding="utf-8")
+    write_config_data(
+        str(config_path),
+        {
+            "DB_PATH": str(db_path),
+            "PROXIES_PATH": str(proxies_path),
+            "USE_PROXIES": True,
+        },
+    )
+
+    repository = SqliteItemsRepository(str(db_path))
+    repository.add_to_bought_items(
+        "AK-47 | Redline",
+        "listing-1",
+        10.0,
+        20.0,
+        "2026-05-20 11:00:00",
+        stickers=[{"name": "Sticker | Crown", "price": 20}],
+    )
+
+    app = create_app(str(config_path))
+    with TestClient(app) as client:
+        summary = client.get("/api/dashboard/summary")
+        sessions = client.get("/api/dashboard/sessions")
+        purchases = client.get("/api/dashboard/recent-purchases")
+        proxies = client.get("/api/dashboard/proxies")
+        config = client.get("/api/dashboard/config")
+
+    assert summary.status_code == 200
+    assert summary.json()["dashboard"]["purchase_count"] == 1
+    assert summary.json()["dashboard"]["proxy_count"] == 1
+    assert "buyer_session" not in summary.json()["dashboard"]
+    assert sessions.status_code == 200
+    assert "buyer_session" in sessions.json()["sessions"]
+    assert purchases.status_code == 200
+    assert purchases.json()["items"][0]["stickers"][0]["name"] == "Sticker | Crown"
+    assert proxies.status_code == 200
+    assert proxies.json()["proxies_enabled"] is True
+    assert config.status_code == 200
+    assert config.json()["config"]["USE_PROXIES"] is True
+
+
 def test_checked_items_endpoint_filters_streaks(tmp_path):
     config_path = tmp_path / "config.json"
     db_path = tmp_path / "items.db"

@@ -151,5 +151,6 @@ def test_bot_records_failed_purchase_attempt():
         assert args[:4] == ("AK-47 | Redline", "listing-1", 10.0, 20)
         assert kwargs["success"] is False
         assert "Somebody already bought it" in kwargs["error"]
+        assert kwargs["stickers"] == [{"name": "Sticker | Crown"}]
 
     asyncio.run(run_bot())

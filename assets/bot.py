@@ -256,6 +256,7 @@ class AsyncSteamBot:
                     datetime.now(),
                     success=True,
                     error="",
+                    stickers=item_obj.stickers,
                 )
                 logger.info(
                     "Bought %s listing %s for %.2f; wallet balance after buy: %s",
@@ -275,6 +276,7 @@ class AsyncSteamBot:
                     datetime.now(),
                     success=False,
                     error=error_message,
+                    stickers=item_obj.stickers,
                 )
                 logger.exception("Failed to buy %s listing %s", item_name, listing_id)
 

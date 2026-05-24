@@ -108,6 +108,12 @@ def _checked_item_from_row(row) -> dict[str, object]:
 
 def _bought_item_from_row(row) -> dict[str, object]:
     item_name = str(row[0] or "")
+    stickers = _parse_stickers(row[7])
+    for sticker in stickers:
+        if isinstance(sticker, dict):
+            sticker_name = str(sticker.get("name") or "")
+            sticker["market_url"] = _sticker_market_url(sticker_name)
+
     return {
         "item_name": item_name,
         "listing_id": str(row[1] or ""),
@@ -117,6 +123,8 @@ def _bought_item_from_row(row) -> dict[str, object]:
         "success": bool(row[5]),
         "status": "success" if row[5] else "failed",
         "error": str(row[6] or ""),
+        "stickers": stickers,
+        "streak": _streak_info(stickers),
         "market_url": _market_url(item_name) if item_name else "",
     }
 
@@ -184,6 +192,7 @@ class SqliteItemsRepository:
             self._ensure_column("StickerPrices", "updated_at", "TEXT")
             self._ensure_column("BoughtItems", "success", "INTEGER DEFAULT 1")
             self._ensure_column("BoughtItems", "error", "TEXT")
+            self._ensure_column("BoughtItems", "stickers_json", "TEXT")
             self._dedupe_track_items()
             cur.execute(
                 """
@@ -196,7 +205,11 @@ class SqliteItemsRepository:
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = [row[1] for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()]
         if column not in columns:
-            self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            try:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
     def _dedupe_track_items(self) -> None:
         self.db.execute(
@@ -410,9 +423,11 @@ class SqliteItemsRepository:
         date,
         success=True,
         error="",
+        stickers=None,
     ) -> None:
         if isinstance(date, datetime):
             date = date.isoformat(sep=" ", timespec="seconds")
+        stickers_json = json.dumps(stickers or [], ensure_ascii=False)
         with self.lock:
             self.db.execute(
                 """
@@ -423,9 +438,10 @@ class SqliteItemsRepository:
                     stickers_price,
                     date,
                     success,
-                    error
+                    error,
+                    stickers_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item_name,
@@ -435,6 +451,7 @@ class SqliteItemsRepository:
                     str(date),
                     1 if success else 0,
                     str(error or ""),
+                    stickers_json,
                 ),
             )
             self.db.commit()
@@ -443,7 +460,8 @@ class SqliteItemsRepository:
         with self.lock:
             rows = self.db.execute(
                 """
-                SELECT item_name, listing_id, price, stickers_price, date, success, error
+                SELECT item_name, listing_id, price, stickers_price, date, success, error,
+                       stickers_json
                 FROM BoughtItems
                 ORDER BY date DESC
                 LIMIT ?
@@ -522,6 +540,7 @@ class Items:
         date,
         success=True,
         error="",
+        stickers=None,
     ):
         return self.repository.add_to_bought_items(
             item_name,
@@ -531,6 +550,7 @@ class Items:
             date,
             success=success,
             error=error,
+            stickers=stickers,
         )
 
     def get_recent_bought_items(self, limit=10):
