@@ -167,6 +167,16 @@ function stickerSlot(sticker, index) {
   return sticker.slot ?? sticker.slot_index ?? sticker.position ?? index + 1;
 }
 
+function stickerWearLabel(sticker) {
+  const rawWear = sticker.wear ?? sticker.wear_value ?? sticker.sticker_wear ?? sticker.scrape ?? sticker.scrape_wear;
+  if (rawWear === null || rawWear === undefined || rawWear === "") return "wear -";
+  const normalized = String(rawWear).trim().replace("%", "").replace(",", ".");
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed)) return `wear ${rawWear}`;
+  const percent = Math.abs(parsed) <= 1 ? parsed * 100 : parsed;
+  return `wear ${percent.toFixed(2).replace(/\.?0+$/, "")}%`;
+}
+
 function App() {
   const [view, setView] = useState("dashboard");
   const [summary, setSummary] = useState(null);
@@ -859,17 +869,7 @@ function InventoryCard({ item, onSell }) {
 
       <div className="chips">
         {(item.stickers || []).map((sticker, index) => (
-          <a
-            className="chip sticker-chip"
-            href={sticker.market_url || undefined}
-            target="_blank"
-            rel="noreferrer"
-            key={`${sticker.name}-${index}`}
-          >
-            <span className="slot">#{stickerSlot(sticker, index)}</span>
-            <span>{sticker.name || "unknown sticker"}</span>
-            <b>{formatValue(sticker.price, " RUB")}</b>
-          </a>
+          <StickerChip sticker={sticker} index={index} key={`${sticker.name}-${index}`} />
         ))}
         {(item.stickers || []).length === 0 && <span className="chip">no stickers</span>}
       </div>
@@ -942,17 +942,7 @@ function CheckedItemCard({ item, compact = false }) {
       </div>
       <div className="chips">
         {visibleStickers.map((sticker, index) => (
-          <a
-            className="chip sticker-chip"
-            href={sticker.market_url || undefined}
-            target="_blank"
-            rel="noreferrer"
-            key={`${sticker.name}-${index}`}
-          >
-            <span className="slot">#{stickerSlot(sticker, index)}</span>
-            <span>{sticker.name || "unknown sticker"}</span>
-            <b>{formatValue(sticker.price, " RUB")}</b>
-          </a>
+          <StickerChip sticker={sticker} index={index} key={`${sticker.name}-${index}`} />
         ))}
         {compact && stickers.length > visibleStickers.length && (
           <span className="chip">+{stickers.length - visibleStickers.length} more</span>
@@ -972,6 +962,25 @@ function PurchaseGrid({ purchases, loading = false }) {
         <PurchaseCard purchase={purchase} key={`${purchase.listing_id}-${purchase.date}-${index}`} />
       ))}
     </div>
+  );
+}
+
+function StickerChip({ sticker, index }) {
+  const name = sticker.name || "unknown sticker";
+  const wear = stickerWearLabel(sticker);
+
+  return (
+    <a
+      className="chip sticker-chip"
+      href={sticker.market_url || undefined}
+      target="_blank"
+      rel="noreferrer"
+      title={`${name} / ${wear}`}
+    >
+      <span className="slot">#{stickerSlot(sticker, index)}</span>
+      <span className="sticker-name">{name} / {wear}</span>
+      <b>{formatValue(sticker.price, " RUB")}</b>
+    </a>
   );
 }
 
@@ -1001,17 +1010,7 @@ function PurchaseCard({ purchase }) {
       </div>
       <div className="chips purchase-stickers">
         {stickers.map((sticker, index) => (
-          <a
-            className="chip sticker-chip"
-            href={sticker.market_url || undefined}
-            target="_blank"
-            rel="noreferrer"
-            key={`${sticker.name}-${index}`}
-          >
-            <span className="slot">#{stickerSlot(sticker, index)}</span>
-            <span>{sticker.name || "unknown sticker"}</span>
-            <b>{formatValue(sticker.price, " RUB")}</b>
-          </a>
+          <StickerChip sticker={sticker} index={index} key={`${sticker.name}-${index}`} />
         ))}
         {stickers.length === 0 && <span className="chip">no stickers</span>}
       </div>

@@ -399,6 +399,10 @@ main {
   color: #263245;
 }
 
+.sticker-name {
+  min-width: 0;
+}
+
 .sticker-chip b,
 .sticker-chip span {
   overflow-wrap: anywhere;
